@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comicpublish"
+version = "0.1.0"
+description = "Skill-driven comic generation scaffold with downloadable exports."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "OpenAI Codex" }
+]
+dependencies = [
+  "streamlit>=1.35,<2",
+]
+
+[project.scripts]
+comicpublish = "comicpublish.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

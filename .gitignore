@@ -1,0 +1,37 @@
+# Local OS/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging/build output
+build/
+dist/
+*.egg-info/
+
+# Generated comic projects and run artifacts
+projects/
+build/projects/
+build/runs/
+build/runner/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
