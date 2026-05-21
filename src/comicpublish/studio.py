@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import re
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -74,6 +76,7 @@ class StudioRequest:
     page_count: int = 4
     comic_style: str = STYLE_PRESETS[0]
     tone_notes: str = DEFAULT_TONE_NOTES
+    auto_generate_images: bool = True
 
     def resolved_title(self) -> str:
         override = self.title_override.strip()
@@ -128,10 +131,12 @@ class StudioRunArtifact:
     root_path: str
     manifest_path: str
     result_path: str
-    archive_path: str
     bundle_size_bytes: int
     story_concept: str
     architect_output: dict[str, Any]
+    progress: int = 0
+    step: int = 0
+    error: str = ""
     logs: list[list[str]] = field(default_factory=list)
     pages: list[StudioPageArtifact] = field(default_factory=list)
 
@@ -169,14 +174,11 @@ def create_studio_run(
     root = (output_dir or config.output_dir) / "projects" / project_slug / run_id
     pages_dir = root / "pages"
     prompts_dir = root / "prompts"
-    export_dir = root / "export"
     root.mkdir(parents=True, exist_ok=True)
     pages_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    export_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
     result_path = root / "result.json"
-    archive_path = export_dir / "pending.zip"
 
     logs: list[list[str]] = []
     story_concept = ""
@@ -208,8 +210,7 @@ def create_studio_run(
             "root_path": str(root),
             "manifest_path": str(manifest_path),
             "result_path": str(result_path),
-            "archive_path": str(archive_path),
-            "bundle_size_bytes": archive_path.stat().st_size if archive_path.exists() else 0,
+            "bundle_size_bytes": directory_size_bytes(root),
             "story_concept": story_concept,
             "architect_output": architect_output,
             "logs": list(logs),
@@ -220,20 +221,54 @@ def create_studio_run(
         }
         progress_callback(snapshot)
 
+    def write_progress_files(status: str) -> None:
+        pages_snapshot = [page.to_dict() for page in page_artifacts]
+        write_json_atomic(
+            result_path,
+            {
+                "story_concept": story_concept,
+                "architect_output": architect_output,
+                "pages": pages_snapshot,
+            },
+        )
+        write_json_atomic(
+            manifest_path,
+            {
+                "run_id": run_id,
+                "created_at": created_at.isoformat(timespec="seconds"),
+                "elapsed_seconds": round(time.monotonic() - started_at, 2),
+                "status": status,
+                "title": title,
+                "series_name": series_name,
+                "source_text": request_payload.source_text.strip(),
+                "audience": request_payload.audience,
+                "output_language": request_payload.output_language,
+                "workflow_preset": request_payload.workflow_preset,
+                "comic_style": request_payload.comic_style,
+                "tone_notes": request_payload.tone_notes.strip(),
+                "requested_page_count": request_payload.sanitized_page_count(),
+                "total_pages": total_pages,
+                "success_count": sum(1 for page in page_artifacts if page.status == "success"),
+                "failure_count": sum(1 for page in page_artifacts if page.status == "failed"),
+                "root_path": str(root),
+                "manifest_path": str(manifest_path),
+                "result_path": str(result_path),
+                "bundle_size_bytes": directory_size_bytes(root),
+                "story_concept": story_concept,
+                "architect_output": architect_output,
+                "logs": list(logs),
+                "pages": pages_snapshot,
+            },
+        )
+
     log_line(logs, started_at, "Run created and operator inputs snapshotted.")
     publish(status="validating", progress=6, step=0)
-    (root / "input.json").write_text(
-        json.dumps(asdict(request_payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(root / "input.json", asdict(request_payload))
 
     story_concept = run_story_concept_agent(request_payload, config)
     log_line(logs, started_at, "Story concept agent returned the teaching concept.")
     publish(status="validating", progress=18, step=0)
-    (root / "analysis.md").write_text(
-        build_analysis_markdown(request_payload, story_concept),
-        encoding="utf-8",
-    )
+    write_text_atomic(root / "analysis.md", build_analysis_markdown(request_payload, story_concept))
 
     architect_output = run_manga_architect_agent(request_payload, story_concept, config)
     log_line(logs, started_at, "Manga architect agent returned structured page JSON.")
@@ -248,10 +283,9 @@ def create_studio_run(
     total_pages = int(architect_output.get("total_pages") or len(pages_payload) or 0)
     if total_pages <= 0:
         raise WorkflowExecutionError("The architect agent returned zero pages.")
-    archive_path = export_dir / f"{series_name}.zip"
-    (root / "storyboard.md").write_text(
+    write_text_atomic(
+        root / "storyboard.md",
         build_storyboard_markdown(title=title, series_name=series_name, pages_payload=pages_payload),
-        encoding="utf-8",
     )
     publish(status="generating", progress=32, step=2)
 
@@ -269,19 +303,53 @@ def create_studio_run(
         page_artifacts.append(artifact)
         publish(status="generating", progress=32, step=2)
 
-    result_path.write_text(
-        json.dumps(
+    write_progress_files(status="generating")
+
+    if not request_payload.auto_generate_images:
+        log_line(
+            logs,
+            started_at,
+            "Planning checkpoint reached; page JSON and prompt files are ready for manual image generation.",
+        )
+        run = StudioRunArtifact(
+            run_id=run_id,
+            created_at=created_at.isoformat(timespec="seconds"),
+            elapsed_seconds=round(time.monotonic() - started_at, 2),
+            status="planned",
+            title=title,
+            series_name=series_name,
+            source_text=request_payload.source_text.strip(),
+            audience=request_payload.audience,
+            output_language=request_payload.output_language,
+            workflow_preset=request_payload.workflow_preset,
+            comic_style=request_payload.comic_style,
+            tone_notes=request_payload.tone_notes.strip(),
+            requested_page_count=request_payload.sanitized_page_count(),
+            total_pages=total_pages,
+            success_count=0,
+            failure_count=0,
+            root_path=str(root),
+            manifest_path=str(manifest_path),
+            result_path=str(result_path),
+            bundle_size_bytes=directory_size_bytes(root),
+            story_concept=story_concept,
+            architect_output=architect_output,
+            progress=52,
+            step=2,
+            logs=logs,
+            pages=page_artifacts,
+        )
+        write_json_atomic(
+            result_path,
             {
                 "story_concept": story_concept,
                 "architect_output": architect_output,
                 "pages": [page.to_dict() for page in page_artifacts],
             },
-            indent=2,
-            ensure_ascii=False,
         )
-        + "\n",
-        encoding="utf-8",
-    )
+        write_json_atomic(manifest_path, run.to_dict())
+        publish(status="planned", progress=52, step=2)
+        return run
 
     parallelism = min(config.image_parallelism, max(1, len(page_artifacts)))
     log_line(logs, started_at, f"Dispatching image generation with {parallelism} parallel workers.")
@@ -289,6 +357,7 @@ def create_studio_run(
         artifact.status = "in-progress"
         artifact.notes = "Image request is in flight."
         write_page_artifact(pages_dir, artifact)
+    write_progress_files(status="generating")
     publish(status="generating", progress=36, step=2)
 
     page_index = {page.id: index for index, page in enumerate(page_artifacts)}
@@ -308,7 +377,17 @@ def create_studio_run(
         for future in as_completed(futures):
             completed_count += 1
             artifact_id = futures[future]
-            page_artifacts[page_index[artifact_id]] = future.result()
+            try:
+                page_artifacts[page_index[artifact_id]] = future.result()
+            except Exception as exc:
+                failed_artifact = mark_page_artifact_failed(
+                    artifact=page_artifacts[page_index[artifact_id]],
+                    error_text=str(exc),
+                    pages_dir=pages_dir,
+                )
+                page_artifacts[page_index[artifact_id]] = failed_artifact
+                log_line(logs, started_at, f"{failed_artifact.id.replace('-', ' ').title()} failed unexpectedly: {exc}")
+            write_progress_files(status="generating")
             progress = 36 + int((completed_count / max(total_pages, 1)) * 48)
             publish(status="generating", progress=min(progress, 92), step=2)
 
@@ -341,39 +420,29 @@ def create_studio_run(
         root_path=str(root),
         manifest_path=str(manifest_path),
         result_path=str(result_path),
-        archive_path=str(archive_path),
         bundle_size_bytes=0,
         story_concept=story_concept,
         architect_output=architect_output,
+        progress=100 if status != "failed" else 42,
+        step=4 if status != "failed" else 1,
         logs=logs,
         pages=page_artifacts,
     )
 
-    result_path.write_text(
-        json.dumps(
-            {
-                "story_concept": story_concept,
-                "architect_output": architect_output,
-                "pages": [page.to_dict() for page in page_artifacts],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
+    write_json_atomic(
+        result_path,
+        {
+            "story_concept": story_concept,
+            "architect_output": architect_output,
+            "pages": [page.to_dict() for page in page_artifacts],
+        },
     )
-    manifest_path.write_text(
-        json.dumps(run.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(manifest_path, run.to_dict())
     publish(status=status if status != "completed" else "generating", progress=94, step=3)
 
     bundle_size_bytes = directory_size_bytes(root)
     run.bundle_size_bytes = bundle_size_bytes
-    manifest_path.write_text(
-        json.dumps(run.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(manifest_path, run.to_dict())
     publish(status=status, progress=100 if status != "failed" else 42, step=4 if status != "failed" else 1)
     return run
 
@@ -456,7 +525,8 @@ def prepare_page_artifact(
         comic_title=request_payload.resolved_title(),
     )
     prompt_path = prompts_dir / f"{page_number:02d}-page-{series_name}.md"
-    prompt_path.write_text(
+    write_text_atomic(
+        prompt_path,
         build_prompt_markdown(
             page_number=page_number,
             total_pages=total_pages,
@@ -464,7 +534,6 @@ def prepare_page_artifact(
             script=script,
             prompt=prompt,
         ),
-        encoding="utf-8",
     )
     log_line(logs, started_at, f"Saved prompt file for page {page_number:02d}.")
 
@@ -517,7 +586,7 @@ def generate_prepared_page_artifact(
 
             file_name = artifact.filename or f"page_{page_number}.png"
             image_path = pages_dir / file_name
-            image_path.write_bytes(image_bytes)
+            write_bytes_atomic(image_path, image_bytes)
             retry_note = f" after {attempt} attempts" if attempt > 1 else ""
             log_line(logs, started_at, f"Page {page_number:02d} generated and saved locally{retry_note}.")
             artifact = StudioPageArtifact(
@@ -597,10 +666,53 @@ def sleep_before_retry(attempt: int) -> None:
 
 def write_page_artifact(pages_dir: Path, artifact: StudioPageArtifact) -> None:
     path = pages_dir / f"page-{artifact.page_number:02d}.json"
-    path.write_text(
-        json.dumps(artifact.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    write_json_atomic(path, artifact.to_dict())
+
+
+def mark_page_artifact_failed(
+    artifact: StudioPageArtifact,
+    error_text: str,
+    pages_dir: Path,
+) -> StudioPageArtifact:
+    failed_artifact = StudioPageArtifact(
+        id=artifact.id,
+        page_number=artifact.page_number,
+        title=artifact.title,
+        excerpt=artifact.excerpt,
+        script=artifact.script,
+        notes="Image generation worker failed before a local image file was saved.",
+        filename=None,
+        image_path="",
+        public_url=None,
+        status="failed",
+        prompt=artifact.prompt,
+        prompt_path=artifact.prompt_path,
+        mime_type="image/png",
+        text_response=artifact.text_response,
+        error=error_text,
     )
+    write_page_artifact(pages_dir, failed_artifact)
+    return failed_artifact
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    temp_path = temp_sibling_path(path)
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(path)
+
+
+def write_bytes_atomic(path: Path, content: bytes) -> None:
+    temp_path = temp_sibling_path(path)
+    temp_path.write_bytes(content)
+    temp_path.replace(path)
+
+
+def temp_sibling_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
 
 
 def build_image_prompt(
@@ -926,6 +1038,8 @@ def http_post_json(
         raise WorkflowExecutionError(
             f"{error_label}: timed out after {timeout_seconds} seconds"
         ) from exc
+    except (http.client.HTTPException, ConnectionError, OSError) as exc:
+        raise WorkflowExecutionError(f"{error_label}: {exc}") from exc
 
     try:
         parsed = json.loads(body)

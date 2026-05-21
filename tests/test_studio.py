@@ -113,9 +113,75 @@ def test_create_studio_run_writes_review_files(
     assert (root / "prompts" / "01-page-mangrove_lessons.md").exists()
     assert (root / "analysis.md").exists()
     assert (root / "storyboard.md").exists()
-    assert not Path(run.archive_path).exists()
     assert snapshots[0]["status"] == "validating"
     assert snapshots[-1]["status"] == "completed"
+
+
+def test_create_studio_run_can_stop_after_page_json_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = WorkflowConfig(
+        planning_api_key="planning-test",
+        planning_model="gemini-3.1-pro",
+        planning_base_url="https://jmrai.net",
+        planning_max_tokens=12000,
+        image_api_key="image-test",
+        image_model="gpt-image-2",
+        image_base_url="https://jmrai.net",
+        image_size="1248x1664",
+        image_parallelism=3,
+        image_retry_attempts=2,
+        output_dir=tmp_path,
+        request_timeout_seconds=120,
+    )
+
+    monkeypatch.setattr(studio, "load_workflow_config", lambda: config)
+    monkeypatch.setattr(
+        studio,
+        "run_story_concept_agent",
+        lambda request_payload, config: "A checkpointed comic concept.",
+    )
+    monkeypatch.setattr(
+        studio,
+        "run_manga_architect_agent",
+        lambda request_payload, story_concept, config: {
+            "series_name": "checkpoint_lessons",
+            "total_pages": 2,
+            "pages_list": [
+                {"page_num": 1, "content": "第一页生成页面脚本。"},
+                {"page_num": 2, "content": "第二页保留等待图片生成。"},
+            ],
+        },
+    )
+
+    def unexpected_image_call(prompt, config):
+        raise AssertionError("image generation should not run during the planning checkpoint")
+
+    monkeypatch.setattr(studio, "call_image_generation", unexpected_image_call)
+    snapshots: list[dict] = []
+
+    run = create_studio_run(
+        StudioRequest(
+            source_text="Checkpoint the prompt files before images.",
+            title_override="Checkpoint Test",
+            page_count=2,
+            auto_generate_images=False,
+        ),
+        tmp_path,
+        progress_callback=snapshots.append,
+    )
+
+    root = Path(run.root_path)
+    assert run.status == "planned"
+    assert run.success_count == 0
+    assert run.failure_count == 0
+    assert len(run.pages) == 2
+    assert (root / "pages" / "page-01.json").exists()
+    assert (root / "pages" / "page-02.json").exists()
+    assert (root / "prompts" / "01-page-checkpoint_lessons.md").exists()
+    assert not (root / "pages" / "checkpoint_lessons_manga_1.png").exists()
+    assert snapshots[-1]["status"] == "planned"
 
 
 def test_first_page_prompt_includes_comic_title() -> None:

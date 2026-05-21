@@ -8,11 +8,12 @@ https://www.xiaohongshu.com/user/profile/602374270000000001007bca
 
 ## What It Does
 
-- Accepts source text, target audience, output language, page count, workflow preset, comic style, and tone notes.
+- Accepts source text, optional title override, output language, page count, comic style, and tone notes.
 - Uses a planning model to turn the source into a teachable comic concept.
 - Uses a second planning pass to produce structured page-by-page storyboard JSON.
 - Converts each storyboard page into a detailed image prompt.
-- Generates portrait comic page images through an OpenAI-compatible image endpoint.
+- Stops at a planning checkpoint after writing per-page JSON and Markdown prompts.
+- Generates or regenerates portrait comic page images through an OpenAI-compatible image endpoint on demand.
 - Saves the input, analysis, storyboard, page prompts, page JSON, image files, manifest, and result JSON under a local run folder.
 - Runs generation in a background thread so the Streamlit UI can keep showing status, logs, progress, metrics, and generated pages.
 - Supports per-page image regeneration from the saved prompt without rerunning the whole planning workflow.
@@ -33,17 +34,20 @@ The workflow is intentionally staged so the output is inspectable and reproducib
 4. **Prompt writing**
    Each page is converted into a saved Markdown prompt file. The prompt includes page number, total pages, script content, audience, language, style, title instructions for page one, and portrait image-size requirements.
 
-5. **Parallel image generation**
-   `ThreadPoolExecutor` dispatches page image requests concurrently. `IMAGE_PARALLELISM` is capped between 1 and 3.
+5. **Operator image checkpoint**
+   The Streamlit gallery lists every planned page before image calls start. The operator can generate all missing images in parallel, generate one page, or retry failed pages from saved JSON and prompt files.
 
-6. **Local artifact persistence**
+6. **Parallel image generation**
+   `ThreadPoolExecutor` dispatches requested page image calls concurrently. `IMAGE_PARALLELISM` is capped between 1 and 3.
+
+7. **Local artifact persistence**
    Every run writes files to:
 
    ```text
    build/projects/<project-slug>/<run-id>/
    ```
 
-7. **Review and regeneration**
+8. **Review and regeneration**
    The UI reads the saved manifest and page JSON files. Failed or unsatisfactory pages can be regenerated from their saved prompt.
 
 ## Architecture
@@ -82,12 +86,10 @@ src/comicpublish/
   runner.py     Background job thread, status snapshots, page regeneration
   studio.py     Main planning, prompt, image generation, and persistence workflow
   config.py     .env loading, endpoint/model settings, validation
-  pipeline.py   Simple CLI scaffold workflow
-  cli.py        comicpublish generate command
-  models.py     Lightweight dataclasses for the CLI scaffold
+  pipeline.py   Shared slug helper
 
 streamlit_app.py  Streamlit entrypoint
-tests/            Unit tests for pipeline, studio, and runner behavior
+tests/            Unit tests for helpers, studio, and runner behavior
 spec/             Product/spec notes
 ```
 
@@ -110,8 +112,6 @@ build/projects/<project-slug>/<run-id>/
   prompts/
     01-page-<series_name>.md
     02-page-<series_name>.md
-  export/
-    # Reserved by the Studio manifest; the current Studio path keeps files local.
 ```
 
 `build/` is intentionally ignored by Git because it contains generated project outputs.
@@ -147,25 +147,6 @@ streamlit run streamlit_app.py
 ```
 
 Do not run the Streamlit app with `python streamlit_app.py`; use `streamlit run streamlit_app.py`.
-
-## CLI Scaffold
-
-The package also includes a simpler scaffold command that creates Markdown page plans and a zip bundle without calling the Studio planning/image workflow.
-
-```bash
-python -m pip install -e . --no-build-isolation
-comicpublish generate \
-  --title "The Neon Alley Case" \
-  --premise "A washed-up detective hunts a missing robot poet in a rain-drenched megacity." \
-  --genre cyberpunk \
-  --pages 4
-```
-
-For a no-install run:
-
-```bash
-PYTHONPATH=src python -m comicpublish generate --title "Demo" --premise "A courier outruns a storm."
-```
 
 ## Git Hygiene
 

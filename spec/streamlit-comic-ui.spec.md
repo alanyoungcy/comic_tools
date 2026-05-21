@@ -2,7 +2,7 @@
 
 ## Objective
 
-Design a Streamlit interface for a single operator to generate educational comics from source text, review the generated pages, and download the result package without touching n8n directly.
+Design a Streamlit interface for a single operator to generate educational comics from source text, review the generated pages, and work from the local project folder.
 
 The UI should feel like a comic production desk, not a generic admin panel.
 
@@ -19,7 +19,7 @@ The primary user is the comic producer. They already understand the topic they w
 - launch the pipeline
 - inspect page-by-page output
 - identify failed pages quickly
-- download the completed comic bundle
+- use the saved local project files
 
 ## Design direction
 
@@ -57,7 +57,6 @@ Use a wide desktop-first layout with a strong left rail and a larger right conte
 Persistent generation controls:
 
 - source text input
-- workflow preset selector
 - target page count
 - tone/style controls
 - language selector
@@ -72,7 +71,7 @@ Dynamic output and run feedback:
 - result summary
 - page gallery
 - page detail inspector
-- download actions
+- project file actions
 
 On mobile, the left rail should collapse above the results stage in a single column.
 
@@ -87,7 +86,7 @@ Contents:
 
 - product name: `ComicPublish Studio`
 - one-line subtitle: generate teachable comics from raw text
-- small environment badge for current backend target such as `n8n: connected`
+- small environment badge for current backend status such as `API configured`
 
 Behavior:
 
@@ -103,7 +102,6 @@ Fields:
 
 - source text textarea
 - optional title override
-- optional audience selector
 - comic style preset
 - desired page count or page-count guidance mode
 - output language
@@ -112,7 +110,6 @@ Fields:
 Controls:
 
 - `Generate Comic`
-- `Load Example`
 - `Reset`
 
 Validation:
@@ -129,9 +126,8 @@ States:
 
 - idle
 - validating
-- sending to n8n
 - generating pages
-- packaging results
+- saving local files
 - completed
 - partial failure
 - failed
@@ -144,7 +140,7 @@ UI elements:
 - elapsed time
 - run ID
 
-If n8n remains synchronous, the app should still simulate stage transitions in a believable way rather than showing a frozen spinner only.
+The runner should write status snapshots frequently so the UI can update without fake demo states.
 
 ### Section 4: Result Summary Panel
 
@@ -202,19 +198,17 @@ Future controls:
 
 In phase 1, the controls may be read-only except for download.
 
-### Section 7: Download Panel
+### Section 7: Project Files Panel
 
 Purpose:
-Expose all export actions clearly.
+Expose the saved local run outputs clearly.
 
 Actions:
 
-- download zip bundle
 - download manifest JSON
-- copy image URLs
-- open local run folder later if supported
+- show local run folder path
 
-The primary action should be the zip file. Secondary actions should be grouped under it, not scattered across the page.
+The primary artifact is the local project folder. The UI should not advertise zip exports or clipboard actions that it does not actually perform.
 
 ## Interaction model
 
@@ -227,14 +221,14 @@ The primary action should be the zip file. Secondary actions should be grouped u
 5. The result summary appears.
 6. The page gallery fills with returned pages.
 7. The user inspects one or more pages.
-8. The user downloads the zip bundle.
+8. The user uses the local project folder or downloads the manifest JSON.
 
 ### Partial failure path
 
 1. Some pages succeed and some fail.
 2. Summary shows partial failure state clearly.
 3. Failed pages remain visible in the gallery.
-4. Download remains available if at least one page succeeded.
+4. Manifest and local project folder remain available if at least one page succeeded.
 5. The failed state should not overwrite successful results.
 
 ### Hard failure path
@@ -292,7 +286,7 @@ Session state should track:
 - current run status
 - current run result payload
 - selected page
-- download artifact path
+- manifest path
 - error message
 
 ### Rendering strategy
@@ -319,10 +313,10 @@ Spacing base:       8px
 
 ## UI acceptance criteria
 
-- The user can understand the workflow without seeing n8n.
-- Input, progress, results, and download actions are visible in one page flow.
+- The user can understand the workflow without seeing backend implementation details.
+- Input, progress, results, and project files are visible in one page flow.
 - Failed pages are obvious without blocking successful page review.
-- The zip download is prominent and unambiguous.
+- The local project folder is prominent and unambiguous.
 - The interface has a distinct comic-studio character rather than default Streamlit styling.
 
 ## Design handoff notes
@@ -337,4 +331,3 @@ If this spec is used to generate a UI design, the design should show:
 - partial failure state with one failed card
 
 The resulting design should prioritize workflow clarity first and visual identity second.
-

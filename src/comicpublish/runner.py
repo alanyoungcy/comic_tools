@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -14,11 +15,14 @@ from comicpublish.studio import (
     create_studio_run,
     directory_size_bytes,
     generate_prepared_page_artifact,
+    write_json_atomic,
 )
 
 
 _RUNNER_THREADS: dict[str, threading.Thread] = {}
 _RUN_FILE_LOCK = threading.Lock()
+_PAGE_REGEN_LOCKS: dict[str, threading.Lock] = {}
+_PAGE_REGEN_LOCKS_GUARD = threading.Lock()
 
 
 def start_background_run(request_payload: StudioRequest) -> str:
@@ -53,7 +57,6 @@ def start_background_run(request_payload: StudioRequest) -> str:
         "root_path": "",
         "manifest_path": "",
         "result_path": "",
-        "archive_path": "",
         "bundle_size_bytes": 0,
         "story_concept": "",
         "architect_output": {},
@@ -120,6 +123,53 @@ def regenerate_page_image(manifest_path: str | Path, page_id: str) -> dict[str, 
     config = load_workflow_config()
     config.validate()
     manifest_path = Path(manifest_path)
+    regen_lock = _page_regen_lock(manifest_path, page_id)
+    if not regen_lock.acquire(blocking=False):
+        run = load_run_from_manifest(manifest_path)
+        if run is not None:
+            return run
+        raise RuntimeError(f"Regeneration already in progress for {page_id}")
+
+    try:
+        return _regenerate_page_image_locked(manifest_path, page_id, config)
+    finally:
+        regen_lock.release()
+
+
+def generate_page_images(manifest_path: str | Path, page_ids: list[str] | None = None) -> dict[str, Any]:
+    config = load_workflow_config()
+    config.validate()
+    manifest_path = Path(manifest_path)
+    run = load_run_from_manifest(manifest_path)
+    if run is None:
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    pages = run.get("pages") or []
+    requested_ids = set(page_ids or [])
+    target_ids = [
+        page["id"]
+        for page in pages
+        if _page_needs_image(page) and (not requested_ids or page["id"] in requested_ids)
+    ]
+    if not target_ids:
+        return run
+
+    max_workers = min(config.image_parallelism, max(1, len(target_ids)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="comic-manual-image") as executor:
+        futures = {
+            executor.submit(regenerate_page_image, manifest_path, page_id): page_id
+            for page_id in target_ids
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    refreshed = load_run_from_manifest(manifest_path)
+    if refreshed is None:
+        raise FileNotFoundError(f"Manifest not found after generation: {manifest_path}")
+    return refreshed
+
+
+def _regenerate_page_image_locked(manifest_path: Path, page_id: str, config: Any) -> dict[str, Any]:
     run = load_run_from_manifest(manifest_path)
     if run is None:
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
@@ -171,16 +221,11 @@ def regenerate_page_image(manifest_path: str | Path, page_id: str) -> dict[str, 
 def snapshot_is_terminal(snapshot: dict[str, Any] | None) -> bool:
     if snapshot is None:
         return False
-    return snapshot.get("status") in {"completed", "partial", "failed"}
+    return snapshot.get("status") in {"planned", "completed", "partial", "failed"}
 
 
 def _write_snapshot(path: Path, snapshot: dict[str, Any]) -> None:
-    temp_path = path.with_suffix(".tmp")
-    temp_path.write_text(
-        json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
+    write_json_atomic(path, snapshot)
 
 
 def _elapsed_label(value: float) -> str:
@@ -190,10 +235,7 @@ def _elapsed_label(value: float) -> str:
 
 
 def _write_page_json(path: Path, artifact: StudioPageArtifact) -> None:
-    path.write_text(
-        json.dumps(artifact.to_dict(), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, artifact.to_dict())
 
 
 def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[str, Any]:
@@ -204,7 +246,8 @@ def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[st
         ]
         success_count = sum(1 for page in pages if page.get("status") == "success")
         failure_count = sum(1 for page in pages if page.get("status") == "failed")
-        in_progress_count = sum(1 for page in pages if page.get("status") in {"queued", "in-progress"})
+        queued_count = sum(1 for page in pages if page.get("status") == "queued")
+        in_progress_count = sum(1 for page in pages if page.get("status") == "in-progress")
 
         run["pages"] = pages
         run["success_count"] = success_count
@@ -212,10 +255,18 @@ def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[st
         run["bundle_size_bytes"] = directory_size_bytes(root)
         if in_progress_count:
             run["status"] = "generating"
+        elif queued_count:
+            run["status"] = "partial" if failure_count else "planned"
         elif failure_count:
             run["status"] = "partial" if success_count else "failed"
         else:
             run["status"] = "completed"
+            run["error"] = ""
+        run["progress"], run["step"] = _run_progress_step(
+            status=run["status"],
+            finished_count=success_count + failure_count,
+            total_count=len(pages),
+        )
 
         result_path = root / "result.json"
         result = {"story_concept": run.get("story_concept", ""), "architect_output": run.get("architect_output", {})}
@@ -227,17 +278,40 @@ def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[st
             if isinstance(loaded_result, dict):
                 result.update(loaded_result)
         result["pages"] = pages
-        _write_json_atomic(result_path, result)
+        write_json_atomic(result_path, result)
 
         manifest_path = root / "manifest.json"
-        _write_json_atomic(manifest_path, run)
+        write_json_atomic(manifest_path, run)
         return run
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    temp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
-    temp_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
+def _page_needs_image(page: dict[str, Any]) -> bool:
+    if page.get("status") in {"queued", "failed"}:
+        return True
+    image_path = str(page.get("image_path") or "")
+    return bool(image_path and not Path(image_path).exists())
+
+
+def _run_progress_step(status: str, finished_count: int, total_count: int) -> tuple[int, int]:
+    if status == "planned":
+        return 52, 2
+    if status == "generating":
+        generated_progress = int((finished_count / max(total_count, 1)) * 40)
+        return min(92, 52 + generated_progress), 2
+    if status == "completed":
+        return 100, 4
+    if status == "partial":
+        return 100, 4
+    if status == "failed":
+        return 42, 1
+    return 0, 0
+
+
+def _page_regen_lock(manifest_path: Path, page_id: str) -> threading.Lock:
+    key = f"{manifest_path.resolve()}::{page_id}"
+    with _PAGE_REGEN_LOCKS_GUARD:
+        lock = _PAGE_REGEN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PAGE_REGEN_LOCKS[key] = lock
+        return lock

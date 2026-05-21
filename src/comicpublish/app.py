@@ -11,18 +11,15 @@ import streamlit as st
 
 from comicpublish.config import ConfigError, load_workflow_config, workflow_env_status
 from comicpublish.runner import (
+    generate_page_images,
     load_background_run,
     regenerate_page_image,
     snapshot_is_terminal,
     start_background_run,
 )
 from comicpublish.studio import (
-    AUDIENCE_OPTIONS,
-    DEFAULT_SOURCE_TEXT,
-    DEFAULT_TONE_NOTES,
     LANGUAGE_OPTIONS,
     STYLE_PRESETS,
-    WORKFLOW_PRESETS,
     StudioRequest,
     humanize_bytes,
 )
@@ -204,36 +201,16 @@ def inject_styles() -> None:
           margin-bottom: 18px;
         }
 
+        .panel-block.compact {
+          margin-bottom: 0;
+        }
+
         .field-label {
           color: var(--ink-muted);
           font: 11px/1 var(--mono);
           letter-spacing: 0.08em;
           text-transform: uppercase;
           margin: 0 0 8px 0;
-        }
-
-        .chip-grid {
-          display: grid;
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 10px;
-          margin-bottom: 14px;
-        }
-
-        .chip {
-          min-height: 44px;
-          display: grid;
-          place-items: center;
-          text-align: center;
-          border: 1.5px solid rgba(43, 39, 35, 0.16);
-          border-radius: 14px;
-          background: rgba(246,240,231,0.86);
-          padding: 10px 12px;
-          font-weight: 700;
-        }
-
-        .chip.active {
-          border-color: var(--ink);
-          background: rgba(22, 20, 18, 0.08);
         }
 
         .stage-toolbar {
@@ -752,60 +729,31 @@ def initialize_session_state() -> None:
     defaults = {
         "source_text": "",
         "title_override": "",
-        "audience": AUDIENCE_OPTIONS[0],
         "output_language": LANGUAGE_OPTIONS[0],
-        "workflow_preset": WORKFLOW_PRESETS[0],
         "page_count": 4,
         "comic_style": STYLE_PRESETS[1],
         "tone_notes": "",
-        "view_state": "partial",
-        "selected_page_id": "page-03",
+        "selected_page_id": "",
         "current_run": None,
         "run_job_id": "",
         "form_error": "",
         "info_message": "",
-        "blank_initial_fields_applied": False,
         "regen_threads": {},
+        "batch_generation_active": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
-
-    if not st.session_state.blank_initial_fields_applied:
-        if st.session_state.source_text == DEFAULT_SOURCE_TEXT:
-            st.session_state.source_text = ""
-        if st.session_state.title_override == "How Mangroves Protect a Coastline":
-            st.session_state.title_override = ""
-        if st.session_state.tone_notes == DEFAULT_TONE_NOTES:
-            st.session_state.tone_notes = ""
-        st.session_state.blank_initial_fields_applied = True
 
 
 def reset_form() -> None:
     st.session_state.source_text = ""
     st.session_state.title_override = ""
-    st.session_state.audience = AUDIENCE_OPTIONS[0]
     st.session_state.output_language = LANGUAGE_OPTIONS[0]
-    st.session_state.workflow_preset = WORKFLOW_PRESETS[0]
     st.session_state.page_count = 4
     st.session_state.comic_style = STYLE_PRESETS[1]
     st.session_state.tone_notes = ""
     st.session_state.form_error = ""
     st.session_state.info_message = "Form reset."
-    st.session_state.view_state = "idle"
-    st.rerun()
-
-
-def load_example() -> None:
-    st.session_state.source_text = DEFAULT_SOURCE_TEXT
-    st.session_state.title_override = "How Mangroves Protect a Coastline"
-    st.session_state.audience = AUDIENCE_OPTIONS[0]
-    st.session_state.output_language = LANGUAGE_OPTIONS[0]
-    st.session_state.workflow_preset = WORKFLOW_PRESETS[0]
-    st.session_state.page_count = 4
-    st.session_state.comic_style = STYLE_PRESETS[1]
-    st.session_state.tone_notes = DEFAULT_TONE_NOTES
-    st.session_state.form_error = ""
-    st.session_state.info_message = "Example loaded."
     st.rerun()
 
 
@@ -819,7 +767,6 @@ def refresh_runner_snapshot() -> None:
         return
 
     st.session_state.current_run = snapshot
-    st.session_state.view_state = snapshot["status"]
     pages = snapshot.get("pages") or []
     if pages and st.session_state.selected_page_id not in {page["id"] for page in pages}:
         st.session_state.selected_page_id = pages[0]["id"]
@@ -830,6 +777,8 @@ def refresh_runner_snapshot() -> None:
             st.session_state.info_message = f"Run {snapshot['run_id']} finished successfully."
         elif snapshot["status"] == "partial":
             st.session_state.info_message = f"Run {snapshot['run_id']} finished with partial page failures."
+        elif snapshot["status"] == "planned":
+            st.session_state.info_message = f"Run {snapshot['run_id']} planned. Page JSON and prompts are ready; start images from the gallery."
         else:
             st.session_state.form_error = f"Run {snapshot['run_id']} failed: {snapshot.get('error') or 'unknown error'}"
 
@@ -846,7 +795,6 @@ def load_latest_local_run() -> None:
     if not manifests:
         return
     st.session_state.current_run = json_load(manifests[0])
-    st.session_state.view_state = st.session_state.current_run.get("status", "completed")
     pages = st.session_state.current_run.get("pages") or []
     if pages:
         st.session_state.selected_page_id = pages[0]["id"]
@@ -864,295 +812,17 @@ def refresh_current_run_from_manifest() -> None:
             for page in st.session_state.current_run.get("pages", [])
         ):
             st.session_state.regen_threads = {}
+            st.session_state.batch_generation_active = False
 
 
 def json_load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def demo_states() -> dict[str, dict]:
-    completed_pages = [
-        {
-            "id": "page-01",
-            "page": "01",
-            "title": "Opening shoreline",
-            "excerpt": "Roots break the incoming wave before it can hit the village edge all at once.",
-            "status": "success",
-            "script": "海岸边的红树林先拆散海浪，再让水慢下来。",
-            "notes": "Use a wide establishing shoreline and keep the village visible in the back plane.",
-            "file": "page-01-shoreline.png",
-            "url": "/runs/page-01-shoreline.png",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "",
-        },
-        {
-            "id": "page-02",
-            "page": "02",
-            "title": "Sediment capture",
-            "excerpt": "The soil stays put because the root mesh traps mud before the current carries it away.",
-            "status": "success",
-            "script": "根系减慢水流，让泥沙沉下来。",
-            "notes": "Make the before/after current difference legible in one reading.",
-            "file": "page-02-sediment.png",
-            "url": "/runs/page-02-sediment.png",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "",
-        },
-        {
-            "id": "page-03",
-            "page": "03",
-            "title": "Root detail",
-            "excerpt": "The root maze becomes a shelter line for juvenile fish and calmer water.",
-            "status": "success",
-            "script": "幼鱼躲在根系之间，避开强流和大鱼。",
-            "notes": "Keep the fish large enough to read on mobile.",
-            "file": "page-03-root-detail.png",
-            "url": "/runs/page-03-root-detail.png",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "",
-        },
-        {
-            "id": "page-04",
-            "page": "04",
-            "title": "Storm payoff",
-            "excerpt": "The final page shows calmer water reaching homes behind the coastline.",
-            "status": "success",
-            "script": "风暴来时，村庄后方接到的水势更缓。",
-            "notes": "Land the recap with one teacher-friendly caption.",
-            "file": "page-04-storm-payoff.png",
-            "url": "/runs/page-04-storm-payoff.png",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "",
-        },
-    ]
-    partial_pages = [
-        {
-            "id": "page-03",
-            "page": "03",
-            "title": "Root detail",
-            "excerpt": "Image generation failed after prompt expansion. Text payload exists, but the page image field returned empty.",
-            "status": "failed",
-            "script": "这一页的讲解文本已经生成，但图像字段为空，需要重新触发图片步骤。",
-            "notes": "Prompt parsing failed after visual style merge. Preserve the page slot and the Chinese teaching text.",
-            "file": "page-03-root-detail.png",
-            "url": "Unavailable",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "backend parsing / empty image field",
-        },
-        completed_pages[0],
-        completed_pages[1],
-        completed_pages[3],
-    ]
-    generating_pages = [
-        completed_pages[0],
-        {
-            "id": "page-02",
-            "page": "02",
-            "title": "Sediment capture",
-            "excerpt": "The runner has reserved this slot while image generation is still in flight.",
-            "status": "in-progress",
-            "script": "第二页脚本已经返回，图像还在处理中。",
-            "notes": "Keep the slot stable while the runner thread finishes the image call.",
-            "file": "page-02-sediment.png",
-            "url": "Processing",
-            "image_path": "",
-            "mime_type": "image/png",
-            "error": "",
-        },
-    ]
-    return {
-        "idle": {
-            "label": "Idle",
-            "tone": "ink",
-            "annotation": "Ready",
-            "title": "Awaiting source text",
-            "body": "The desk is ready for a new source brief. No active run exists yet.",
-            "run_id": "—",
-            "elapsed": "—",
-            "error": "No active run",
-            "progress": 0,
-            "step": -1,
-            "logs": [["Ready", "Paste source material and start a run."]],
-            "summary": {
-                "series": "No active series",
-                "requested": "—",
-                "returned": "—",
-                "success": "—",
-                "failure": "—",
-                "bundle": "Unavailable",
-                "timestamp": "No run yet",
-                "zip": "No project files available",
-                "order": "No pages returned",
-                "count": "0 cards",
-                "ready_label": "Waiting for run",
-            },
-            "pages": [],
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-        "validating": {
-            "label": "Validating",
-            "tone": "signal",
-            "annotation": "Preparing payload",
-            "title": "Checking source text and run settings",
-            "body": "The runner thread is normalizing the brief, writing the input snapshot, and preparing the workflow calls.",
-            "run_id": "CP-240519-0818",
-            "elapsed": "00:18",
-            "error": "Validation in progress",
-            "progress": 18,
-            "step": 0,
-            "logs": [["00:06", "Run record created."], ["00:18", "Payload checks still in progress."]],
-            "summary": {
-                "series": "How Mangroves Protect a Coastline",
-                "requested": "4",
-                "returned": "0",
-                "success": "0",
-                "failure": "0",
-                "bundle": "Pending",
-                "timestamp": "19 May 2026 · 20:18",
-                "zip": "Project files are not ready",
-                "order": "No pages returned",
-                "count": "0 cards",
-                "ready_label": "Bundle pending",
-            },
-            "pages": [],
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-        "generating": {
-            "label": "Generating",
-            "tone": "signal",
-            "annotation": "Runner active",
-            "title": "Pages are arriving while the run is active",
-            "body": "The generation thread is writing prompt files, calling the image backend, and saving page images one by one.",
-            "run_id": "CP-240519-0820",
-            "elapsed": "02:46",
-            "error": "Page image generation still active",
-            "progress": 68,
-            "step": 2,
-            "logs": [["00:10", "Validation passed and payload dispatched."], ["02:46", "Page 01 returned; page 02 still running."]],
-            "summary": {
-                "series": "How Mangroves Protect a Coastline",
-                "requested": "4",
-                "returned": "1",
-                "success": "1",
-                "failure": "0",
-                "bundle": "Pending",
-                "timestamp": "19 May 2026 · 20:20",
-                "zip": "Image generation is still running",
-                "order": "Reserved page slots stay visible",
-                "count": "2 cards",
-                "ready_label": "Generating",
-            },
-            "pages": generating_pages,
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-        "completed": {
-            "label": "Completed",
-            "tone": "success",
-            "annotation": "All pages saved",
-            "title": "The comic project folder is ready",
-            "body": "All page images saved successfully. The operator can inspect the pages and project files.",
-            "run_id": "CP-240519-0822",
-            "elapsed": "04:12",
-            "error": "Workflow completed cleanly",
-            "progress": 100,
-            "step": 4,
-            "logs": [["00:10", "Validation passed and payload dispatched."], ["04:12", "All four pages saved and ready."]],
-            "summary": {
-                "series": "How Mangroves Protect a Coastline",
-                "requested": "4",
-                "returned": "4",
-                "success": "4",
-                "failure": "0",
-                "bundle": "28.4 MB",
-                "timestamp": "19 May 2026 · 20:22",
-                "zip": "4 successful pages · 28.4 MB local files · manifest included",
-                "order": "Showing proof order",
-                "count": "4 cards",
-                "ready_label": "Bundle ready",
-            },
-            "pages": completed_pages,
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-        "partial": {
-            "label": "Partial failure",
-            "tone": "warn",
-            "annotation": "Pages returned: 3 of 4",
-            "title": "Three pages good, one page needs retry",
-            "body": "The request completed with usable output. Successful pages remain reviewable and downloadable, while the failed page stays visible with its error context intact.",
-            "run_id": "CP-240519-0823",
-            "elapsed": "04:51",
-            "error": "Failure source · empty image field after prompt expansion",
-            "progress": 100,
-            "step": 3,
-            "logs": [["00:10", "Validation passed and payload dispatched."], ["03:58", "Three pages returned with valid local image files and notes."], ["04:51", "Page 03 failed after prompt expansion; partial project preserved."]],
-            "summary": {
-                "series": "How Mangroves Protect a Coastline",
-                "requested": "4",
-                "returned": "3",
-                "success": "3",
-                "failure": "1",
-                "bundle": "21.1 MB",
-                "timestamp": "19 May 2026 · 20:23",
-                "zip": "3 successful pages · 21.1 MB local files · manifest included",
-                "order": "Failed page sorted to the front",
-                "count": "4 cards",
-                "ready_label": "Partial project preserved",
-            },
-            "pages": partial_pages,
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-        "failed": {
-            "label": "Failed",
-            "tone": "warn",
-            "annotation": "No usable pages returned",
-            "title": "The run failed before valid images were produced",
-            "body": "No image assets were preserved. The operator can retry the request without retyping the source text.",
-            "run_id": "CP-240519-0825",
-            "elapsed": "00:52",
-            "error": "Failure source · backend parsing error",
-            "progress": 42,
-            "step": 1,
-            "logs": [["00:10", "Validation passed and payload dispatched."], ["00:52", "Backend returned invalid image payloads for all pages."]],
-            "summary": {
-                "series": "How Mangroves Protect a Coastline",
-                "requested": "4",
-                "returned": "0",
-                "success": "0",
-                "failure": "4",
-                "bundle": "Unavailable",
-                "timestamp": "19 May 2026 · 20:25",
-                "zip": "No images available",
-                "order": "No pages returned",
-                "count": "0 cards",
-                "ready_label": "Run failed",
-            },
-            "pages": [],
-            "download_ready": False,
-            "archive_path": "",
-            "manifest_path": "",
-        },
-    }
-
-
 def build_live_state() -> dict | None:
     run = st.session_state.current_run
     if run is None:
-        return None
+        return idle_state()
 
     created_at = format_timestamp(run["created_at"])
     pages = []
@@ -1186,6 +856,7 @@ def build_live_state() -> dict | None:
 
     label_map = {
         "validating": "Validating",
+        "planned": "Planned",
         "generating": "Generating",
         "completed": "Completed",
         "partial": "Partial failure",
@@ -1193,6 +864,7 @@ def build_live_state() -> dict | None:
     }
     tone_map = {
         "validating": "signal",
+        "planned": "ink",
         "generating": "signal",
         "completed": "success",
         "partial": "warn",
@@ -1200,6 +872,7 @@ def build_live_state() -> dict | None:
     }
     annotation_map = {
         "validating": "Preparing payload",
+        "planned": f"Pages planned: {len(pages)}",
         "generating": f"Pages returned: {success_count} of {requested_count}",
         "completed": "All pages saved",
         "partial": f"Pages returned: {success_count} of {requested_count}",
@@ -1207,6 +880,7 @@ def build_live_state() -> dict | None:
     }
     title_map = {
         "validating": "Checking source text and run settings",
+        "planned": "Page JSON and prompts are ready",
         "generating": "The runner thread is actively building pages",
         "completed": "The comic project folder is ready",
         "partial": "Some pages are good, one or more pages need retry",
@@ -1214,6 +888,7 @@ def build_live_state() -> dict | None:
     }
     body_map = {
         "validating": "The runner thread is normalizing the brief and preparing the workflow calls.",
+        "planned": "The planning stage has stopped at a safe checkpoint. Review the planned pages, then generate all missing images or one page at a time.",
         "generating": "Prompt files are already persisted. Image generation continues in the background while the desk stays responsive.",
         "completed": "All page images saved successfully. The operator can inspect the pages and project files.",
         "partial": "The request completed with usable output. Successful pages remain reviewable and downloadable, while failed pages stay visible with error context intact.",
@@ -1240,26 +915,49 @@ def build_live_state() -> dict | None:
             "failure": str(failure_count),
             "bundle": bundle_size,
             "timestamp": created_at,
-            "zip": f"{success_count} successful pages · {bundle_size} local files · manifest included" if success_count else "No images available",
             "order": "Failed page sorted to the front" if status == "partial" else "Showing proof order",
             "count": f"{len(pages)} cards",
-            "ready_label": "Partial project preserved" if status == "partial" else "Project ready" if status == "completed" else "Generating" if status == "generating" else "Project pending",
+            "ready_label": "Ready for image generation" if status == "planned" else "Partial project preserved" if status == "partial" else "Project ready" if status == "completed" else "Generating" if status == "generating" else "Project pending",
         },
         "pages": pages,
-        "download_ready": status in {"completed", "partial"} and success_count > 0,
-        "archive_path": run["archive_path"],
+        "files_ready": status in {"planned", "completed", "partial"} and bool(pages),
         "manifest_path": run["manifest_path"],
     }
 
 
+def idle_state() -> dict:
+    return {
+        "label": "Idle",
+        "tone": "ink",
+        "annotation": "Ready",
+        "title": "Awaiting source text",
+        "body": "Paste source material and start a run. No demo or placeholder comic is loaded.",
+        "run_id": "—",
+        "elapsed": "—",
+        "error": "No active run",
+        "progress": 0,
+        "step": -1,
+        "logs": [["Ready", "Paste source material and start a run."]],
+        "summary": {
+            "series": "No active series",
+            "requested": "—",
+            "returned": "—",
+            "success": "—",
+            "failure": "—",
+            "bundle": "Unavailable",
+            "timestamp": "No run yet",
+            "order": "No pages returned",
+            "count": "0 cards",
+            "ready_label": "Waiting for run",
+        },
+        "pages": [],
+        "files_ready": False,
+        "manifest_path": "",
+    }
+
+
 def resolve_display_state() -> dict:
-    live_state = build_live_state()
-    if live_state is not None and (
-        st.session_state.run_job_id
-        or st.session_state.view_state == st.session_state.current_run["status"]
-    ):
-        return live_state
-    return demo_states()[st.session_state.view_state]
+    return build_live_state()
 
 
 def current_page(payload: dict) -> dict | None:
@@ -1294,6 +992,8 @@ def format_elapsed(value: float) -> str:
 def default_error_label(status: str, failure_count: int) -> str:
     if status == "validating":
         return "Validation in progress"
+    if status == "planned":
+        return "Waiting for operator to start image generation"
     if status == "generating":
         return "Runner thread active"
     if status == "partial":
@@ -1317,7 +1017,7 @@ def status_label(status: str) -> str:
         "success": "Success",
         "failed": "Failed",
         "in-progress": "Generating",
-        "queued": "Queued",
+        "queued": "Ready",
     }.get(status, status.title())
 
 
@@ -1357,10 +1057,6 @@ def render_topbar(display_state: dict) -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-def render_page_close() -> None:
-    return
 
 
 def render_section_head(caption: str, title: str, meta: str) -> None:
@@ -1438,19 +1134,14 @@ def render_input_rail() -> None:
         label_visibility="collapsed",
     )
     submitted = st.button(
-        "Generate Comic" if not locked else "Run in progress",
+        "Plan Comic Pages" if not locked else "Run in progress",
         key="generate_comic_button",
         use_container_width=True,
         disabled=locked,
     )
 
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        if st.button("Load Example", use_container_width=True, disabled=locked):
-            load_example()
-    with action_col2:
-        if st.button("Reset", use_container_width=True, disabled=locked):
-            reset_form()
+    if st.button("Reset Form", use_container_width=True, disabled=locked):
+        reset_form()
     st.markdown(
         '<div class="footer-note">Fill the API credentials in <code>.env</code> before starting a live run. Outputs are saved under the local project folder.</div>',
         unsafe_allow_html=True,
@@ -1466,29 +1157,25 @@ def handle_generate() -> None:
     source_text = st.session_state.source_text.strip()
     if not source_text:
         st.session_state.form_error = "Source text is required before a run can be generated."
-        st.session_state.view_state = "idle"
         st.rerun()
 
     request_payload = StudioRequest(
         source_text=source_text,
         title_override=st.session_state.title_override,
-        audience=st.session_state.audience,
         output_language=st.session_state.output_language,
-        workflow_preset=st.session_state.workflow_preset,
         page_count=int(st.session_state.page_count),
         comic_style=st.session_state.comic_style,
         tone_notes=st.session_state.tone_notes,
+        auto_generate_images=False,
     )
     try:
         job_id = start_background_run(request_payload)
     except ConfigError as exc:
         st.session_state.form_error = f"Workflow configuration error: {exc}. Update .env and retry."
-        st.session_state.view_state = "idle"
         st.rerun()
 
     st.session_state.current_run = None
     st.session_state.run_job_id = job_id
-    st.session_state.view_state = "validating"
     st.session_state.info_message = f"Runner thread started: {job_id}"
     st.rerun()
 
@@ -1509,7 +1196,7 @@ def render_stage(display_state: dict) -> None:
     render_summary(display_state)
     render_gallery(display_state)
     render_inspector(display_state)
-    render_downloads(display_state)
+    render_project_files(display_state)
 
 def render_status_banner(payload: dict) -> None:
     progress_steps = []
@@ -1635,6 +1322,23 @@ def render_gallery(payload: dict) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
+    actionable_page_ids = missing_image_page_ids(pages)
+    action_cols = st.columns([0.45, 0.55])
+    with action_cols[0]:
+        if st.button(
+            "Generate Missing Images",
+            key="generate-missing-images",
+            use_container_width=True,
+            disabled=not can_start_batch_generation(actionable_page_ids),
+        ):
+            start_missing_image_generation(actionable_page_ids)
+            st.rerun()
+    with action_cols[1]:
+        st.markdown(
+            f'<div class="footer-note">Queued or failed pages: {len(actionable_page_ids)} · Image workers use the saved page JSON and prompt files.</div>',
+            unsafe_allow_html=True,
+        )
+
     cols = st.columns(4)
     for index, page in enumerate(pages):
         with cols[index % 4]:
@@ -1675,7 +1379,7 @@ def render_gallery(payload: dict) -> None:
                 st.session_state.selected_page_id = page["id"]
                 st.rerun()
             if st.button(
-                f"Regenerate Page {page['page']}",
+                page_image_button_label(page),
                 key=f"regenerate-{page['id']}",
                 use_container_width=True,
                 disabled=not can_regenerate_page(page),
@@ -1685,9 +1389,41 @@ def render_gallery(payload: dict) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def missing_image_page_ids(pages: list[dict]) -> list[str]:
+    page_ids = []
+    for page in pages:
+        image_path = page.get("image_path", "")
+        if page.get("status") in {"queued", "failed"}:
+            page_ids.append(page["id"])
+        elif image_path and not Path(image_path).exists():
+            page_ids.append(page["id"])
+    return page_ids
+
+
+def can_start_batch_generation(page_ids: list[str]) -> bool:
+    run = st.session_state.current_run
+    if not page_ids or not run or not run.get("manifest_path"):
+        return False
+    if st.session_state.run_job_id or st.session_state.batch_generation_active:
+        return False
+    return not any(page.get("status") == "in-progress" for page in run.get("pages", []))
+
+
+def page_image_button_label(page: dict) -> str:
+    if page.get("status") == "queued":
+        return f"Generate Page {page['page']}"
+    if page.get("status") == "failed":
+        return f"Retry Page {page['page']}"
+    return f"Regenerate Page {page['page']}"
+
+
 def can_regenerate_page(page: dict) -> bool:
     run = st.session_state.current_run
     if not run or not run.get("manifest_path") or not run.get("root_path"):
+        return False
+    if st.session_state.batch_generation_active:
+        return False
+    if page.get("id") in st.session_state.regen_threads:
         return False
     if page.get("status") == "in-progress":
         return False
@@ -1721,6 +1457,23 @@ def start_page_regeneration(page_id: str) -> None:
     st.session_state.regen_threads[page_id] = True
     thread.start()
     st.session_state.info_message = f"Regeneration started for {page_id}."
+
+
+def start_missing_image_generation(page_ids: list[str]) -> None:
+    run = st.session_state.current_run
+    if not run or not run.get("manifest_path"):
+        st.session_state.form_error = "No manifest is available for image generation."
+        return
+
+    def worker() -> None:
+        generate_page_images(run["manifest_path"], page_ids)
+
+    thread = threading.Thread(target=worker, name="generate-missing-images", daemon=True)
+    st.session_state.batch_generation_active = True
+    for page_id in page_ids:
+        st.session_state.regen_threads[page_id] = True
+    thread.start()
+    st.session_state.info_message = f"Image generation started for {len(page_ids)} queued or failed pages."
 
 
 def render_inspector(payload: dict) -> None:
@@ -1797,15 +1550,15 @@ def render_inspector(payload: dict) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_downloads(payload: dict) -> None:
+def render_project_files(payload: dict) -> None:
     summary = payload["summary"]
     st.markdown(
         f"""
-        <div class="panel-block">
+        <div class="panel-block compact">
           <div class="panel-head">
             <div class="section-head" style="gap:6px; margin:0;">
               <div class="section-title">Project files</div>
-              <div class="section-meta">Manifest, image paths, and local project folder</div>
+              <div class="section-meta">Manifest and local project folder</div>
             </div>
             <span class="pill ink">{html.escape(summary['ready_label'])}</span>
           </div>
@@ -1814,33 +1567,14 @@ def render_downloads(payload: dict) -> None:
     )
 
     manifest_path = payload.get("manifest_path", "")
-    ready = payload["download_ready"] and manifest_path and Path(manifest_path).exists()
+    ready = payload["files_ready"] and manifest_path and Path(manifest_path).exists()
     run = st.session_state.current_run
-
-    cols = st.columns(3)
-    card_specs = [
-        ("Project folder", "Local files are saved", summary["zip"], "primary"),
-        ("Manifest", "Download manifest JSON", "Notes, filenames, prompts, and run metadata.", ""),
-        ("Clipboard", "Copy image paths", "Useful for review docs and downstream scripts.", ""),
-    ]
-    for col, (small, strong, copy, extra) in zip(cols, card_specs, strict=True):
-        with col:
-            st.markdown(
-                f"""
-                <div class="download-card {extra}">
-                  <small>{html.escape(small)}</small>
-                  <strong>{html.escape(strong)}</strong>
-                  <p>{html.escape(copy)}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
     if not ready or run is None:
         st.markdown(
             """
             <div class="detail-card">
-              <p>Project file actions unlock after a live run writes a manifest.</p>
+              <p>Project files appear here after a live run writes a manifest.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1848,12 +1582,17 @@ def render_downloads(payload: dict) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    image_paths = "\n".join(
-        page["public_url"] or page["image_path"]
-        for page in run["pages"]
-        if page["public_url"] or page["image_path"]
+    st.markdown(
+        f"""
+        <div class="download-card primary">
+          <small>Local output</small>
+          <strong>{html.escape(str(run.get("success_count", 0)))} successful pages · {html.escape(summary["bundle"])}</strong>
+          <p>All generated assets stay in the project folder below. No zip export is produced.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    action_cols = st.columns(3)
+    action_cols = st.columns([0.35, 0.65])
     with action_cols[0]:
         st.download_button(
             "Download manifest JSON",
@@ -1863,14 +1602,6 @@ def render_downloads(payload: dict) -> None:
             use_container_width=True,
         )
     with action_cols[1]:
-        st.download_button(
-            "Copy image paths",
-            data=image_paths.encode("utf-8"),
-            file_name="image-paths.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    with action_cols[2]:
         st.code(run["root_path"], language=None)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1894,9 +1625,13 @@ def main() -> None:
         render_input_rail()
     with stage:
         render_stage(display_state)
-    render_page_close()
 
-    if st.session_state.run_job_id or st.session_state.regen_threads:
+    if (
+        st.session_state.run_job_id
+        or st.session_state.regen_threads
+        or st.session_state.batch_generation_active
+        or current_run_has_active_page()
+    ):
         st.caption("Runner thread active. The page auto-refreshes every second while the workflow is running.")
         st.markdown(
             """
@@ -1908,6 +1643,11 @@ def main() -> None:
             """,
             unsafe_allow_html=True,
         )
+
+
+def current_run_has_active_page() -> bool:
+    run = st.session_state.current_run or {}
+    return any(page.get("status") == "in-progress" for page in run.get("pages", []))
 
 
 if __name__ == "__main__":
