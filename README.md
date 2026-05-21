@@ -1,15 +1,156 @@
-# comicpublish
+# Comic Tools
 
-`comicpublish` is the local package behind AtSolution Comic Studio, a Streamlit production desk for turning source text into teachable comic pages and saving the result as local project files.
+Comic Tools is a local production desk for turning long-form source text into short educational comic pages. The main application is **AtSolution Comic Studio**, a Streamlit UI that runs a structured planning and image-generation workflow, saves every intermediate artifact, and lets an operator review or regenerate pages.
 
-## What this first version does
+Published examples can be viewed on my Xiaohongshu profile:
 
-- Provides an installable Python package and CLI
-- Generates a comic outline, page prompts, and manifest files
-- Saves generated pages, prompt records, page JSON files, and manifests in a local project folder
-- Keeps the generation logic local and easy to extend with real model-backed skills later
+https://www.xiaohongshu.com/user/profile/602374270000000001007bca
 
-## Quick start
+## What It Does
+
+- Accepts source text, target audience, output language, page count, workflow preset, comic style, and tone notes.
+- Uses a planning model to turn the source into a teachable comic concept.
+- Uses a second planning pass to produce structured page-by-page storyboard JSON.
+- Converts each storyboard page into a detailed image prompt.
+- Generates portrait comic page images through an OpenAI-compatible image endpoint.
+- Saves the input, analysis, storyboard, page prompts, page JSON, image files, manifest, and result JSON under a local run folder.
+- Runs generation in a background thread so the Streamlit UI can keep showing status, logs, progress, metrics, and generated pages.
+- Supports per-page image regeneration from the saved prompt without rerunning the whole planning workflow.
+
+## Method
+
+The workflow is intentionally staged so the output is inspectable and reproducible.
+
+1. **Operator input**
+   The Streamlit app collects the source text and production settings.
+
+2. **Concept planning**
+   `run_story_concept_agent()` asks a chat-completions-compatible model to create a comic learning concept from the source text.
+
+3. **Storyboard architecture**
+   `run_manga_architect_agent()` asks the planning model to return strict JSON with a `series_name`, `total_pages`, and `pages_list`.
+
+4. **Prompt writing**
+   Each page is converted into a saved Markdown prompt file. The prompt includes page number, total pages, script content, audience, language, style, title instructions for page one, and portrait image-size requirements.
+
+5. **Parallel image generation**
+   `ThreadPoolExecutor` dispatches page image requests concurrently. `IMAGE_PARALLELISM` is capped between 1 and 3.
+
+6. **Local artifact persistence**
+   Every run writes files to:
+
+   ```text
+   build/projects/<project-slug>/<run-id>/
+   ```
+
+7. **Review and regeneration**
+   The UI reads the saved manifest and page JSON files. Failed or unsatisfactory pages can be regenerated from their saved prompt.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Streamlit UI<br/>streamlit_app.py] --> B[App shell<br/>comicpublish.app]
+    B --> C[Background runner<br/>comicpublish.runner]
+    C --> D[Workflow engine<br/>comicpublish.studio]
+
+    D --> E[Story concept agent<br/>chat completions]
+    E --> F[Manga architect agent<br/>strict JSON]
+    F --> G[Prompt builder<br/>per-page Markdown]
+    G --> H[Image generation workers<br/>parallel requests]
+
+    H --> I[Page PNG files]
+    G --> J[Prompt files]
+    F --> K[storyboard.md]
+    E --> L[analysis.md]
+    D --> M[manifest.json and result.json]
+
+    I --> N[Local project folder<br/>build/projects/project/run]
+    J --> N
+    K --> N
+    L --> N
+    M --> N
+
+    N --> O[Review gallery and per-page regeneration]
+```
+
+## Code Layout
+
+```text
+src/comicpublish/
+  app.py        Streamlit UI rendering, forms, gallery, status panels
+  runner.py     Background job thread, status snapshots, page regeneration
+  studio.py     Main planning, prompt, image generation, and persistence workflow
+  config.py     .env loading, endpoint/model settings, validation
+  pipeline.py   Simple CLI scaffold workflow
+  cli.py        comicpublish generate command
+  models.py     Lightweight dataclasses for the CLI scaffold
+
+streamlit_app.py  Streamlit entrypoint
+tests/            Unit tests for pipeline, studio, and runner behavior
+spec/             Product/spec notes
+```
+
+## Generated Run Structure
+
+The real Studio workflow writes a complete run folder:
+
+```text
+build/projects/<project-slug>/<run-id>/
+  input.json
+  analysis.md
+  storyboard.md
+  manifest.json
+  result.json
+  pages/
+    page-01.json
+    page-02.json
+    <series_name>_manga_1.png
+    <series_name>_manga_2.png
+  prompts/
+    01-page-<series_name>.md
+    02-page-<series_name>.md
+  export/
+    # Reserved by the Studio manifest; the current Studio path keeps files local.
+```
+
+`build/` is intentionally ignored by Git because it contains generated project outputs.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in the real credentials.
+
+```env
+PLANNING_BASE_URL=https://jmrai.net
+PLANNING_API_KEY=
+PLANNING_MODEL=gemini-3.1-pro
+PLANNING_MAX_TOKENS=12000
+
+IMAGE_BASE_URL=https://jmrai.net
+IMAGE_API_KEY=
+IMAGE_MODEL=gpt-image-2
+IMAGE_SIZE=1248x1664
+IMAGE_PARALLELISM=3
+IMAGE_RETRY_ATTEMPTS=2
+
+COMICPUBLISH_OUTPUT_DIR=build
+REQUEST_TIMEOUT_SECONDS=300
+```
+
+The planning endpoint must support OpenAI-style `/v1/chat/completions`. The image endpoint must support OpenAI-style `/v1/images/generations` with `response_format=b64_json`.
+
+## Run The Studio
+
+```bash
+python -m pip install -e . --no-build-isolation
+streamlit run streamlit_app.py
+```
+
+Do not run the Streamlit app with `python streamlit_app.py`; use `streamlit run streamlit_app.py`.
+
+## CLI Scaffold
+
+The package also includes a simpler scaffold command that creates Markdown page plans and a zip bundle without calling the Studio planning/image workflow.
 
 ```bash
 python -m pip install -e . --no-build-isolation
@@ -20,58 +161,19 @@ comicpublish generate \
   --pages 4
 ```
 
-Generated output goes into `build/` by default.
-
-## Streamlit studio
-
-The repo includes a Streamlit operator UI based on the editorial comic-desk design.
-
-Before running the app, fill the workflow credentials in `.env`:
-
-- `PLANNING_BASE_URL`, `PLANNING_API_KEY`, and `PLANNING_MODEL` for OpenAI-compatible chat completions
-- `IMAGE_BASE_URL`, `IMAGE_API_KEY`, `IMAGE_MODEL`, and optional `IMAGE_SIZE` for OpenAI-compatible image generation. The default is `1248x1664`, a portrait comic page size whose width and height are both divisible by 16.
-- `COMICPUBLISH_OUTPUT_DIR` for the local project output root
-
-```bash
-python -m pip install -e . --no-build-isolation
-streamlit run streamlit_app.py
-```
-
-The app mirrors the useful parts of the n8n flow in Python: story concept generation, page planning, per-page prompt persistence, image generation, and local project file output. Supabase and zip export are no longer used. Completed runs are written into `build/projects/<project-slug>/<run-id>/`.
-
-Generation runs execute in a background runner thread. The Streamlit stage polls runner snapshots so the status banner, logs, metrics, and gallery update while the workflow is still running. Each run also persists `analysis.md`, `storyboard.md`, and per-page prompt files in `prompts/` before image generation, so the comic build stays inspectable and reproducible.
-
-Planning and image calls can be slow because the workflow waits for model responses and high-resolution page images. Page images are generated in parallel after all prompts are written; set `IMAGE_PARALLELISM=1`, `2`, or `3` to control concurrency. The default request timeout is `300` seconds per API call; reduce page count for faster runs or raise `REQUEST_TIMEOUT_SECONDS` if your image endpoint regularly needs more time.
-
-The image generation list loads from local page JSON files. Each planned page is shown as queued, in progress, failed, or success, and each page can be regenerated independently from its saved prompt without rerunning planning.
-
-Do not start it with `python streamlit_app.py`; that path now exits immediately with the correct instruction. Use `streamlit run streamlit_app.py`.
-
-If you only want to run it without installing, use:
+For a no-install run:
 
 ```bash
 PYTHONPATH=src python -m comicpublish generate --title "Demo" --premise "A courier outruns a storm."
 ```
 
-## Example output
+## Git Hygiene
 
-```text
-build/
-  projects/
-    how-mangroves-protect-a-coastline/
-      CP-260520-104455/
-        analysis.md
-        storyboard.md
-        manifest.json
-        result.json
-        pages/
-          page-01.json
-          mangrove_lessons_manga_1.png
-        prompts/
-          01-page-mangrove_lessons.md
-```
+The repository tracks source, tests, specs, README, and configuration examples. It does not track local secrets or generated comic projects:
 
-## Next steps
-
-- Add retry controls for failed individual pages
-- Add optional PDF export for direct reading
+- `.env`
+- `build/`
+- `build/projects/`
+- `build/runs/`
+- `build/runner/`
+- Python caches and packaging output
