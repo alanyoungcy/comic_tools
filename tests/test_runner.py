@@ -169,7 +169,15 @@ def test_page_regeneration_deduplicates_same_page_workers(tmp_path: Path, monkey
     started = False
     calls = {"count": 0}
 
-    def fake_generate_prepared_page_artifact(artifact, pages_dir, config, started_at, logs):
+    def fake_generate_prepared_page_artifact(
+        artifact,
+        pages_dir,
+        config,
+        started_at,
+        logs,
+        session_log_path=None,
+        session_elapsed_label=None,
+    ):
         nonlocal started
         started = True
         calls["count"] += 1
@@ -266,7 +274,15 @@ def test_generate_page_images_runs_only_missing_pages(tmp_path: Path, monkeypatc
     )
     calls: list[str] = []
 
-    def fake_generate_prepared_page_artifact(artifact, pages_dir, config, started_at, logs):
+    def fake_generate_prepared_page_artifact(
+        artifact,
+        pages_dir,
+        config,
+        started_at,
+        logs,
+        session_log_path=None,
+        session_elapsed_label=None,
+    ):
         calls.append(artifact.id)
         artifact.status = "success"
         artifact.error = None
@@ -285,3 +301,5 @@ def test_generate_page_images_runs_only_missing_pages(tmp_path: Path, monkeypatc
     assert updated["failure_count"] == 0
     assert updated["progress"] == 100
     assert updated["step"] == 4
+    session_log = json.loads((root / "session-log.json").read_text(encoding="utf-8"))
+    assert any("Dispatching image generation" in entry[1] for entry in session_log["logs"])

@@ -329,6 +329,14 @@ def inject_styles() -> None:
           gap: 8px;
         }
 
+        .session-log-scroll {
+          display: grid;
+          gap: 8px;
+          max-height: 320px;
+          overflow-y: auto;
+          padding-right: 6px;
+        }
+
         .log-entry {
           display: grid;
           grid-template-columns: 72px 1fr;
@@ -345,7 +353,7 @@ def inject_styles() -> None:
 
         .metrics-grid {
           display: grid;
-          grid-template-columns: 1.45fr repeat(5, minmax(0, 1fr));
+          grid-template-columns: 1.45fr repeat(6, minmax(0, 1fr));
           gap: 10px;
         }
 
@@ -376,6 +384,38 @@ def inject_styles() -> None:
         .metric-value.series {
           font-size: 28px;
           line-height: 1.02;
+        }
+
+        .summary-copy {
+          margin-top: 14px;
+          border-top: 1px solid rgba(43, 39, 35, 0.10);
+          padding-top: 14px;
+          display: grid;
+          gap: 10px;
+        }
+
+        .summary-copy p {
+          margin: 0;
+          color: var(--ink);
+          line-height: 1.6;
+        }
+
+        .hashtag-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .hashtag-chip {
+          display: inline-flex;
+          align-items: center;
+          padding: 7px 11px;
+          border-radius: 999px;
+          border: 1.5px solid rgba(43, 39, 35, 0.16);
+          background: rgba(246,240,231,0.88);
+          color: var(--ink);
+          font: 11px/1 var(--mono);
+          letter-spacing: 0.04em;
         }
 
         .panel-head {
@@ -740,6 +780,7 @@ def initialize_session_state() -> None:
         "info_message": "",
         "regen_threads": {},
         "batch_generation_active": False,
+        "auto_resumed_manifests": set(),
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -778,7 +819,7 @@ def refresh_runner_snapshot() -> None:
         elif snapshot["status"] == "partial":
             st.session_state.info_message = f"Run {snapshot['run_id']} finished with partial page failures."
         elif snapshot["status"] == "planned":
-            st.session_state.info_message = f"Run {snapshot['run_id']} planned. Page JSON and prompts are ready; start images from the gallery."
+            st.session_state.info_message = f"Run {snapshot['run_id']} planned. Auto-resume will dispatch queued images."
         else:
             st.session_state.form_error = f"Run {snapshot['run_id']} failed: {snapshot.get('error') or 'unknown error'}"
 
@@ -806,17 +847,56 @@ def refresh_current_run_from_manifest() -> None:
         return
     manifest_path = Path(run["manifest_path"])
     if manifest_path.exists():
-        st.session_state.current_run = json_load(manifest_path)
+        refreshed_run = json_load(manifest_path)
+        refreshed_run["logs"] = load_session_logs(refreshed_run)
+        st.session_state.current_run = refreshed_run
         if not any(
             page.get("status") == "in-progress"
-            for page in st.session_state.current_run.get("pages", [])
+            for page in refreshed_run.get("pages", [])
         ):
             st.session_state.regen_threads = {}
             st.session_state.batch_generation_active = False
+        if not auto_resume_page_ids(refreshed_run.get("pages", [])):
+            st.session_state.auto_resumed_manifests.discard(str(manifest_path))
+
+
+def maybe_auto_resume_missing_images() -> None:
+    run = st.session_state.current_run
+    if not run or not run.get("manifest_path"):
+        return
+    manifest_path = str(run["manifest_path"])
+    if manifest_path in st.session_state.auto_resumed_manifests:
+        return
+    if st.session_state.run_job_id or st.session_state.batch_generation_active:
+        return
+    if any(page.get("status") == "in-progress" for page in run.get("pages", [])):
+        return
+    page_ids = auto_resume_page_ids(run.get("pages", []))
+    if not page_ids:
+        return
+    start_missing_image_generation(page_ids, auto_triggered=True)
+    st.session_state.auto_resumed_manifests.add(manifest_path)
 
 
 def json_load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_session_logs(run: dict) -> list[list[str]]:
+    root_path = run.get("root_path")
+    if not root_path:
+        return list(run.get("logs") or [])
+    session_log_path = Path(root_path) / "session-log.json"
+    if not session_log_path.exists():
+        return list(run.get("logs") or [])
+    try:
+        payload = json.loads(session_log_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return list(run.get("logs") or [])
+    logs = payload.get("logs")
+    if not isinstance(logs, list):
+        return list(run.get("logs") or [])
+    return [[str(entry[0]), str(entry[1])] for entry in logs if isinstance(entry, list) and len(entry) == 2]
 
 
 def build_live_state() -> dict | None:
@@ -851,6 +931,8 @@ def build_live_state() -> dict | None:
     success_count = int(run["success_count"])
     failure_count = int(run["failure_count"])
     requested_count = int(run["requested_page_count"])
+    queued_count = sum(1 for page in pages if page["status"] == "queued")
+    in_progress_count = sum(1 for page in pages if page["status"] == "in-progress")
     returned_count = success_count if status in {"partial", "failed"} else len(pages)
     bundle_size = humanize_bytes(run["bundle_size_bytes"])
 
@@ -872,28 +954,35 @@ def build_live_state() -> dict | None:
     }
     annotation_map = {
         "validating": "Preparing payload",
-        "planned": f"Pages planned: {len(pages)}",
-        "generating": f"Pages returned: {success_count} of {requested_count}",
+        "planned": f"Queued: {queued_count} · Ready to dispatch",
+        "generating": f"Done: {success_count} · Running: {in_progress_count} · Queued: {queued_count}",
         "completed": "All pages saved",
         "partial": f"Pages returned: {success_count} of {requested_count}",
         "failed": "No usable pages returned",
     }
     title_map = {
         "validating": "Checking source text and run settings",
-        "planned": "Page JSON and prompts are ready",
-        "generating": "The runner thread is actively building pages",
+        "planned": "Queued pages are waiting for automatic dispatch",
+        "generating": "The runner thread is actively building page images",
         "completed": "The comic project folder is ready",
         "partial": "Some pages are good, one or more pages need retry",
         "failed": "The run failed before valid images were produced",
     }
     body_map = {
         "validating": "The runner thread is normalizing the brief and preparing the workflow calls.",
-        "planned": "The planning stage has stopped at a safe checkpoint. Review the planned pages, then generate all missing images or one page at a time.",
-        "generating": "Prompt files are already persisted. Image generation continues in the background while the desk stays responsive.",
+        "planned": "Planning finished. The app will automatically resume any queued pages and keep the log moving as each image worker starts.",
+        "generating": "Prompt files are already persisted. The desk refreshes from live manifest and session-log data while image requests, retries, and page saves happen in the background.",
         "completed": "All page images saved successfully. The operator can inspect the pages and project files.",
         "partial": "The request completed with usable output. Successful pages remain reviewable and downloadable, while failed pages stay visible with error context intact.",
         "failed": "No image assets were preserved. The operator can retry the request without retyping the source text.",
     }
+
+    progress_value = int(run.get("progress", 0))
+    if status == "generating" and requested_count > 0:
+        active_progress = 52 + int(((success_count + failure_count) + (0.35 * in_progress_count)) / requested_count * 40)
+        progress_value = max(progress_value, min(active_progress, 92))
+    if status == "planned" and queued_count:
+        progress_value = max(progress_value, 52)
 
     return {
         "label": label_map[status],
@@ -904,11 +993,14 @@ def build_live_state() -> dict | None:
         "run_id": run["run_id"],
         "elapsed": format_elapsed(run["elapsed_seconds"]),
         "error": run.get("error") or default_error_label(status, failure_count),
-        "progress": int(run.get("progress", 0)),
+        "progress": progress_value,
         "step": int(run.get("step", 0)),
         "logs": run["logs"],
         "summary": {
             "series": run["title"],
+            "comic_summary": run.get("comic_summary") or "",
+            "suggested_hashtags": list(run.get("suggested_hashtags") or []),
+            "output_language": run.get("output_language", ""),
             "requested": str(requested_count),
             "returned": str(returned_count),
             "success": str(success_count),
@@ -917,7 +1009,7 @@ def build_live_state() -> dict | None:
             "timestamp": created_at,
             "order": "Failed page sorted to the front" if status == "partial" else "Showing proof order",
             "count": f"{len(pages)} cards",
-            "ready_label": "Ready for image generation" if status == "planned" else "Partial project preserved" if status == "partial" else "Project ready" if status == "completed" else "Generating" if status == "generating" else "Project pending",
+            "ready_label": "Auto-resume pending" if status == "planned" else "Partial project preserved" if status == "partial" else "Project ready" if status == "completed" else "Generating" if status == "generating" else "Project pending",
         },
         "pages": pages,
         "files_ready": status in {"planned", "completed", "partial"} and bool(pages),
@@ -940,6 +1032,9 @@ def idle_state() -> dict:
         "logs": [["Ready", "Paste source material and start a run."]],
         "summary": {
             "series": "No active series",
+            "comic_summary": "",
+            "suggested_hashtags": [],
+            "output_language": "",
             "requested": "—",
             "returned": "—",
             "success": "—",
@@ -993,7 +1088,7 @@ def default_error_label(status: str, failure_count: int) -> str:
     if status == "validating":
         return "Validation in progress"
     if status == "planned":
-        return "Waiting for operator to start image generation"
+        return "Waiting for auto-resume to dispatch queued image generation"
     if status == "generating":
         return "Runner thread active"
     if status == "partial":
@@ -1073,7 +1168,11 @@ def render_section_head(caption: str, title: str, meta: str) -> None:
 
 
 def render_input_rail() -> None:
-    locked = bool(st.session_state.run_job_id)
+    locked = bool(
+        st.session_state.run_job_id
+        or st.session_state.batch_generation_active
+        or current_run_has_active_page()
+    )
     render_section_head("Issue controls", "Source Input", "Single operator · form locked while run is active")
 
     if st.session_state.form_error:
@@ -1134,13 +1233,13 @@ def render_input_rail() -> None:
         label_visibility="collapsed",
     )
     submitted = st.button(
-        "Plan Comic Pages" if not locked else "Run in progress",
+        "Generate Comic" if not locked else "Run in progress",
         key="generate_comic_button",
-        use_container_width=True,
+        width="stretch",
         disabled=locked,
     )
 
-    if st.button("Reset Form", use_container_width=True, disabled=locked):
+    if st.button("Reset Form", width="stretch", disabled=locked):
         reset_form()
     st.markdown(
         '<div class="footer-note">Fill the API credentials in <code>.env</code> before starting a live run. Outputs are saved under the local project folder.</div>',
@@ -1166,7 +1265,7 @@ def handle_generate() -> None:
         page_count=int(st.session_state.page_count),
         comic_style=st.session_state.comic_style,
         tone_notes=st.session_state.tone_notes,
-        auto_generate_images=False,
+        auto_generate_images=True,
     )
     try:
         job_id = start_background_run(request_payload)
@@ -1176,6 +1275,7 @@ def handle_generate() -> None:
 
     st.session_state.current_run = None
     st.session_state.run_job_id = job_id
+    st.session_state.batch_generation_active = False
     st.session_state.info_message = f"Runner thread started: {job_id}"
     st.rerun()
 
@@ -1193,6 +1293,7 @@ def render_stage(display_state: dict) -> None:
         unsafe_allow_html=True,
     )
     render_status_banner(display_state)
+    render_session_log(display_state)
     render_summary(display_state)
     render_gallery(display_state)
     render_inspector(display_state)
@@ -1259,8 +1360,46 @@ def render_status_banner(payload: dict) -> None:
     )
 
 
+def render_session_log(payload: dict) -> None:
+    lines = []
+    for time_label, line in payload["logs"][-120:]:
+        lines.append(
+            html_block(
+                f"""
+                <div class="log-entry">
+                  <time>{html.escape(time_label)}</time>
+                  <div>{html.escape(line)}</div>
+                </div>
+                """
+            )
+        )
+    st.markdown(
+        html_block(
+            f"""
+            <div class="panel-block">
+              <div class="panel-head">
+                <div class="section-head" style="gap:6px; margin:0;">
+                  <div class="section-title">Session Log</div>
+                  <div class="section-meta">Persistent run log for planning, generation, retries, and recovery</div>
+                </div>
+                <span class="pill ink">{len(payload['logs'])} entries</span>
+              </div>
+              <div class="session-log-scroll">{''.join(lines) if lines else '<div class="page-copy">No log entries yet.</div>'}</div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def render_summary(payload: dict) -> None:
     summary = payload["summary"]
+    hashtags = "".join(
+        f'<span class="hashtag-chip">{html.escape(tag)}</span>'
+        for tag in summary.get("suggested_hashtags", [])
+    )
+    summary_copy = html.escape(summary.get("comic_summary") or "No comic summary generated yet.")
+    output_language = html.escape(summary.get("output_language") or "Unavailable")
     st.markdown(
         f"""
         <div class="panel-block">
@@ -1273,11 +1412,18 @@ def render_summary(payload: dict) -> None:
           </div>
           <div class="metrics-grid">
             {metric_cell("Series", summary["series"], True)}
+            {metric_cell("Language", output_language)}
             {metric_cell("Requested", summary["requested"])}
             {metric_cell("Returned", summary["returned"])}
             {metric_cell("Succeeded", summary["success"])}
             {metric_cell("Failed", summary["failure"])}
             {metric_cell("Output size", summary["bundle"])}
+          </div>
+          <div class="summary-copy">
+            <div class="metric-label">Comic summary</div>
+            <p>{summary_copy}</p>
+            <div class="metric-label">Suggested hashtags</div>
+            <div class="hashtag-row">{hashtags or '<span class="page-copy">No hashtags generated yet.</span>'}</div>
           </div>
         </div>
         """,
@@ -1300,7 +1446,7 @@ def render_gallery(payload: dict) -> None:
           <div class="panel-head">
             <div class="section-head" style="gap:6px; margin:0;">
               <div class="section-title">Image generation list</div>
-              <div class="section-meta">Every planned page image stays visible and regeneratable</div>
+              <div class="section-meta">Queued pages auto-resume; any failed page remains regeneratable</div>
             </div>
             <span class="pill {'warn' if int(str(payload['summary']['failure']).replace('—','0') or 0) else 'ink'}">{html.escape(payload['summary']['count'])}</span>
           </div>
@@ -1328,7 +1474,7 @@ def render_gallery(payload: dict) -> None:
         if st.button(
             "Generate Missing Images",
             key="generate-missing-images",
-            use_container_width=True,
+            width="stretch",
             disabled=not can_start_batch_generation(actionable_page_ids),
         ):
             start_missing_image_generation(actionable_page_ids)
@@ -1350,7 +1496,7 @@ def render_gallery(payload: dict) -> None:
                 classes.append("selected")
             image_path = page.get("image_path", "")
             if image_path and Path(image_path).exists():
-                st.image(image_path, use_container_width=True)
+                st.image(image_path, width="stretch")
             else:
                 st.markdown(
                     f'<div class="thumb {"failed" if page["status"] == "failed" else ""}"></div>',
@@ -1374,14 +1520,14 @@ def render_gallery(payload: dict) -> None:
             if st.button(
                 f"Inspect Page {page['page']}",
                 key=f"inspect-{page['id']}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.selected_page_id = page["id"]
                 st.rerun()
             if st.button(
                 page_image_button_label(page),
                 key=f"regenerate-{page['id']}",
-                use_container_width=True,
+                width="stretch",
                 disabled=not can_regenerate_page(page),
             ):
                 start_page_regeneration(page["id"])
@@ -1396,6 +1542,21 @@ def missing_image_page_ids(pages: list[dict]) -> list[str]:
         if page.get("status") in {"queued", "failed"}:
             page_ids.append(page["id"])
         elif image_path and not Path(image_path).exists():
+            page_ids.append(page["id"])
+    return page_ids
+
+
+def auto_resume_page_ids(pages: list[dict]) -> list[str]:
+    page_ids = []
+    for page in pages:
+        image_path = page.get("image_path", "")
+        prompt_path = page.get("prompt_path", "")
+        has_prompt = bool(page.get("prompt") or (prompt_path and Path(prompt_path).exists()))
+        if not has_prompt:
+            continue
+        if page.get("status") == "queued":
+            page_ids.append(page["id"])
+        elif page.get("status") == "success" and image_path and not Path(image_path).exists():
             page_ids.append(page["id"])
     return page_ids
 
@@ -1459,7 +1620,7 @@ def start_page_regeneration(page_id: str) -> None:
     st.session_state.info_message = f"Regeneration started for {page_id}."
 
 
-def start_missing_image_generation(page_ids: list[str]) -> None:
+def start_missing_image_generation(page_ids: list[str], auto_triggered: bool = False) -> None:
     run = st.session_state.current_run
     if not run or not run.get("manifest_path"):
         st.session_state.form_error = "No manifest is available for image generation."
@@ -1473,7 +1634,10 @@ def start_missing_image_generation(page_ids: list[str]) -> None:
     for page_id in page_ids:
         st.session_state.regen_threads[page_id] = True
     thread.start()
-    st.session_state.info_message = f"Image generation started for {len(page_ids)} queued or failed pages."
+    if auto_triggered:
+        st.session_state.info_message = f"Auto-resumed image generation for {len(page_ids)} queued pages."
+    else:
+        st.session_state.info_message = f"Image generation started for {len(page_ids)} queued or failed pages."
 
 
 def render_inspector(payload: dict) -> None:
@@ -1506,7 +1670,7 @@ def render_inspector(payload: dict) -> None:
     left, right = st.columns([1.05, 0.95], gap="large")
     with left:
         if page.get("image_path") and Path(page["image_path"]).exists():
-            st.image(page["image_path"], use_container_width=True)
+            st.image(page["image_path"], width="stretch")
         else:
             note = "Retry candidate" if page["status"] == "failed" else "Selected page"
             st.markdown(
@@ -1545,7 +1709,7 @@ def render_inspector(payload: dict) -> None:
                 data=Path(page["image_path"]).read_bytes(),
                 file_name=Path(page["image_path"]).name,
                 mime=page.get("mime_type", "image/png"),
-                use_container_width=True,
+                width="stretch",
             )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1599,7 +1763,7 @@ def render_project_files(payload: dict) -> None:
             data=Path(manifest_path).read_bytes(),
             file_name=Path(manifest_path).name,
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
     with action_cols[1]:
         st.code(run["root_path"], language=None)
@@ -1618,6 +1782,7 @@ def main() -> None:
     refresh_runner_snapshot()
     load_latest_local_run()
     refresh_current_run_from_manifest()
+    maybe_auto_resume_missing_images()
     display_state = resolve_display_state()
     render_topbar(display_state)
     rail, stage = st.columns([0.32, 0.68], gap="large")
@@ -1630,15 +1795,15 @@ def main() -> None:
         st.session_state.run_job_id
         or st.session_state.regen_threads
         or st.session_state.batch_generation_active
-        or current_run_has_active_page()
+        or current_run_needs_refresh()
     ):
-        st.caption("Runner thread active. The page auto-refreshes every second while the workflow is running.")
+        st.caption("Runner thread active. The page auto-refreshes while the workflow and image retries are moving.")
         st.markdown(
             """
             <script>
             setTimeout(function () {
               window.location.reload();
-            }, 1000);
+            }, 700);
             </script>
             """,
             unsafe_allow_html=True,
@@ -1648,6 +1813,15 @@ def main() -> None:
 def current_run_has_active_page() -> bool:
     run = st.session_state.current_run or {}
     return any(page.get("status") == "in-progress" for page in run.get("pages", []))
+
+
+def current_run_needs_refresh() -> bool:
+    run = st.session_state.current_run or {}
+    if not run:
+        return False
+    if run.get("status") in {"validating", "generating", "planned"}:
+        return True
+    return current_run_has_active_page()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ https://www.xiaohongshu.com/user/profile/602374270000000001007bca
 - Accepts source text, optional title override, output language, page count, comic style, and tone notes.
 - Uses a planning model to turn the source into a teachable comic concept.
 - Uses a second planning pass to produce structured page-by-page storyboard JSON.
+- Auto-generates a localized comic title, a short localized summary, and 5 suggested hashtags for each run.
 - Converts each storyboard page into a detailed image prompt.
 - Stops at a planning checkpoint after writing per-page JSON and Markdown prompts.
 - Generates or regenerates portrait comic page images through an OpenAI-compatible image endpoint on demand.
@@ -29,7 +30,7 @@ The workflow is intentionally staged so the output is inspectable and reproducib
    `run_story_concept_agent()` asks a chat-completions-compatible model to create a comic learning concept from the source text.
 
 3. **Storyboard architecture**
-   `run_manga_architect_agent()` asks the planning model to return strict JSON with a `series_name`, `total_pages`, and `pages_list`.
+   `run_manga_architect_agent()` asks the planning model to return strict JSON with a localized `display_title`, `comic_summary`, `suggested_hashtags`, plus `series_name`, `total_pages`, and `pages_list`.
 
 4. **Prompt writing**
    Each page is converted into a saved Markdown prompt file. The prompt includes page number, total pages, script content, audience, language, style, title instructions for page one, and portrait image-size requirements.
@@ -113,6 +114,8 @@ build/projects/<project-slug>/<run-id>/
     01-page-<series_name>.md
     02-page-<series_name>.md
 ```
+
+`manifest.json` and `result.json` also persist the generated localized title, summary, and suggested hashtags so the Streamlit desk can render them directly.
 
 `build/` is intentionally ignored by Git because it contains generated project outputs.
 

@@ -23,6 +23,7 @@ _RUNNER_THREADS: dict[str, threading.Thread] = {}
 _RUN_FILE_LOCK = threading.Lock()
 _PAGE_REGEN_LOCKS: dict[str, threading.Lock] = {}
 _PAGE_REGEN_LOCKS_GUARD = threading.Lock()
+_SESSION_LOG_FILE = "session-log.json"
 
 
 def start_background_run(request_payload: StudioRequest) -> str:
@@ -60,6 +61,8 @@ def start_background_run(request_payload: StudioRequest) -> str:
         "bundle_size_bytes": 0,
         "story_concept": "",
         "architect_output": {},
+        "comic_summary": "",
+        "suggested_hashtags": [],
         "logs": [["00:00", "Runner thread queued."]],
         "pages": [],
         "progress": 2,
@@ -154,6 +157,8 @@ def generate_page_images(manifest_path: str | Path, page_ids: list[str] | None =
     if not target_ids:
         return run
 
+    root = Path(run["root_path"])
+    _append_session_log(root, run, f"Dispatching image generation for {len(target_ids)} missing pages.")
     max_workers = min(config.image_parallelism, max(1, len(target_ids)))
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="comic-manual-image") as executor:
         futures = {
@@ -186,6 +191,7 @@ def _regenerate_page_image_locked(manifest_path: Path, page_id: str, config: Any
         artifact.filename = f"{run['series_name']}_manga_{page_number}.png"
     artifact.image_path = str(pages_dir / artifact.filename)
     _write_page_json(page_path, artifact)
+    _append_session_log(root, run, f"Page {page_number:02d} image generation started.")
     _sync_run_files(root, run, pages_dir)
 
     try:
@@ -195,6 +201,8 @@ def _regenerate_page_image_locked(manifest_path: Path, page_id: str, config: Any
             config=config,
             started_at=datetime.now().timestamp(),
             logs=[],
+            session_log_path=_session_log_path(root),
+            session_elapsed_label=_elapsed_for_run(run),
         )
     except Exception as exc:
         result = StudioPageArtifact(
@@ -214,7 +222,10 @@ def _regenerate_page_image_locked(manifest_path: Path, page_id: str, config: Any
             text_response="",
             error=str(exc),
         )
+        _append_session_log(root, run, f"Page {page_number:02d} failed before an image file was saved: {exc}")
     _write_page_json(page_path, result)
+    if result.status == "success":
+        _append_session_log(root, run, f"Page {page_number:02d} image saved to the local project folder.")
     return _sync_run_files(root, run, pages_dir)
 
 
@@ -253,6 +264,7 @@ def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[st
         run["success_count"] = success_count
         run["failure_count"] = failure_count
         run["bundle_size_bytes"] = directory_size_bytes(root)
+        run["logs"] = _load_session_logs(root, fallback=run.get("logs") or [])
         if in_progress_count:
             run["status"] = "generating"
         elif queued_count:
@@ -283,6 +295,42 @@ def _sync_run_files(root: Path, run: dict[str, Any], pages_dir: Path) -> dict[st
         manifest_path = root / "manifest.json"
         write_json_atomic(manifest_path, run)
         return run
+
+
+def _session_log_path(root: Path) -> Path:
+    return root / _SESSION_LOG_FILE
+
+
+def _load_session_logs(root: Path, fallback: list[list[str]] | None = None) -> list[list[str]]:
+    path = _session_log_path(root)
+    if not path.exists():
+        return list(fallback or [])
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return list(fallback or [])
+    logs = payload.get("logs")
+    if not isinstance(logs, list):
+        return list(fallback or [])
+    return [[str(entry[0]), str(entry[1])] for entry in logs if isinstance(entry, list) and len(entry) == 2]
+
+
+def _append_session_log(root: Path, run: dict[str, Any], message: str) -> None:
+    with _RUN_FILE_LOCK:
+        logs = _load_session_logs(root, fallback=run.get("logs") or [])
+        logs.append([_elapsed_for_run(run), message])
+        write_json_atomic(_session_log_path(root), {"logs": logs})
+        run["logs"] = logs
+
+
+def _elapsed_for_run(run: dict[str, Any]) -> str:
+    try:
+        created_at = datetime.fromisoformat(str(run["created_at"]))
+    except (KeyError, TypeError, ValueError):
+        return "00:00"
+    elapsed_seconds = max(0, int((datetime.now().astimezone() - created_at).total_seconds()))
+    minutes, seconds = divmod(elapsed_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def _page_needs_image(page: dict[str, Any]) -> bool:

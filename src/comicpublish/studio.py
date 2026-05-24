@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import random
 import re
 import socket
 import threading
@@ -64,6 +65,7 @@ class WorkflowExecutionError(RuntimeError):
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+_STREAM_RETRY_GATE = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -134,6 +136,8 @@ class StudioRunArtifact:
     bundle_size_bytes: int
     story_concept: str
     architect_output: dict[str, Any]
+    comic_summary: str = ""
+    suggested_hashtags: list[str] = field(default_factory=list)
     progress: int = 0
     step: int = 0
     error: str = ""
@@ -154,6 +158,127 @@ def infer_title(source_text: str) -> str:
         return "Untitled Lesson Comic"
 
     return " ".join(words[:5]).title()
+
+
+def is_chinese_output_language(output_language: str) -> bool:
+    lowered = normalize_whitespace(output_language).lower()
+    return any(marker in lowered for marker in ("chinese", "中文", "mandarin"))
+
+
+def sanitize_generated_title(title: str, output_language: str, fallback: str) -> str:
+    candidate = normalize_whitespace(title) or normalize_whitespace(fallback)
+    if not candidate:
+        candidate = "Untitled Lesson Comic"
+    if is_chinese_output_language(output_language):
+        return candidate[:20].strip() or fallback or "未命名漫画"
+    words = candidate.split()
+    if len(words) <= 20:
+        return candidate
+    return " ".join(words[:20]).strip()
+
+
+def resolve_generated_title(
+    request_payload: StudioRequest,
+    architect_output: dict[str, Any],
+    fallback: str,
+) -> str:
+    candidate = str(architect_output.get("display_title") or fallback)
+    return sanitize_generated_title(candidate, request_payload.output_language, fallback)
+
+
+def fallback_comic_summary(title: str, output_language: str) -> str:
+    if is_chinese_output_language(output_language):
+        return (
+            f"本漫画围绕《{title}》展开，通过循序渐进的场景、对白与解释，"
+            "带读者理解主题的核心概念、关键机制与实际意义。"
+        )
+    return (
+        f"This comic uses staged scenes and guided dialogue to explain {title}, "
+        "helping the reader understand the core ideas, key mechanisms, and practical takeaways."
+    )
+
+
+def resolve_generated_summary(
+    request_payload: StudioRequest,
+    architect_output: dict[str, Any],
+    fallback_title: str,
+) -> str:
+    candidate = normalize_whitespace(str(architect_output.get("comic_summary") or ""))
+    if candidate:
+        return candidate
+    return fallback_comic_summary(fallback_title, request_payload.output_language)
+
+
+def hashtag_from_phrase(value: str) -> str:
+    compact = normalize_whitespace(value)
+    if not compact:
+        return ""
+    if re.search(r"[\u4e00-\u9fff]", compact):
+        cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", compact)
+        return f"#{cleaned}" if cleaned else ""
+    words = re.findall(r"[A-Za-z0-9]+", compact)
+    if not words:
+        return ""
+    return "#" + "".join(word[:1].upper() + word[1:] for word in words[:6])
+
+
+def fallback_hashtag_pool(title: str, output_language: str) -> list[str]:
+    primary = hashtag_from_phrase(title)
+    if is_chinese_output_language(output_language):
+        return [
+            primary,
+            "#知识漫画",
+            "#教育漫画",
+            "#漫画学习",
+            "#漫画创作",
+            "#AtSolutionComicStudio",
+        ]
+    return [
+        primary,
+        "#KnowledgeComic",
+        "#EducationalComic",
+        "#ComicExplainer",
+        "#ComicStudio",
+        "#AtSolutionComicStudio",
+    ]
+
+
+def resolve_suggested_hashtags(
+    request_payload: StudioRequest,
+    architect_output: dict[str, Any],
+    fallback_title: str,
+) -> list[str]:
+    raw_hashtags = architect_output.get("suggested_hashtags") or []
+    if isinstance(raw_hashtags, str):
+        raw_hashtags = re.split(r"[,，#\n]+", raw_hashtags)
+    if not isinstance(raw_hashtags, list):
+        raw_hashtags = []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in list(raw_hashtags) + fallback_hashtag_pool(fallback_title, request_payload.output_language):
+        tag = normalize_whitespace(str(item))
+        if not tag:
+            continue
+        if not tag.startswith("#"):
+            tag = hashtag_from_phrase(tag)
+        else:
+            tag = "#" + re.sub(r"\s+", "", tag.lstrip("#"))
+        if not tag or tag == "#":
+            continue
+        if tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        normalized.append(tag)
+        if len(normalized) == 5:
+            break
+    filler_prefix = "漫画主题" if is_chinese_output_language(request_payload.output_language) else "ComicTopic"
+    while len(normalized) < 5:
+        filler = f"#{filler_prefix}{len(normalized) + 1}"
+        if filler.lower() not in seen:
+            seen.add(filler.lower())
+            normalized.append(filler)
+    return normalized
 
 
 def create_studio_run(
@@ -179,6 +304,7 @@ def create_studio_run(
     prompts_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
     result_path = root / "result.json"
+    session_log_path = root / "session-log.json"
 
     logs: list[list[str]] = []
     story_concept = ""
@@ -186,6 +312,8 @@ def create_studio_run(
     page_artifacts: list[StudioPageArtifact] = []
     total_pages = request_payload.sanitized_page_count()
     series_name = ""
+    comic_summary = ""
+    suggested_hashtags: list[str] = []
 
     def publish(status: str, progress: int, step: int, error_text: str = "") -> None:
         if progress_callback is None:
@@ -213,6 +341,8 @@ def create_studio_run(
             "bundle_size_bytes": directory_size_bytes(root),
             "story_concept": story_concept,
             "architect_output": architect_output,
+            "comic_summary": comic_summary,
+            "suggested_hashtags": list(suggested_hashtags),
             "logs": list(logs),
             "pages": [page.to_dict() for page in sort_pages_for_display(page_artifacts)],
             "progress": progress,
@@ -223,11 +353,14 @@ def create_studio_run(
 
     def write_progress_files(status: str) -> None:
         pages_snapshot = [page.to_dict() for page in page_artifacts]
+        write_json_atomic(session_log_path, {"logs": list(logs)})
         write_json_atomic(
             result_path,
             {
                 "story_concept": story_concept,
                 "architect_output": architect_output,
+                "comic_summary": comic_summary,
+                "suggested_hashtags": list(suggested_hashtags),
                 "pages": pages_snapshot,
             },
         )
@@ -256,6 +389,8 @@ def create_studio_run(
                 "bundle_size_bytes": directory_size_bytes(root),
                 "story_concept": story_concept,
                 "architect_output": architect_output,
+                "comic_summary": comic_summary,
+                "suggested_hashtags": list(suggested_hashtags),
                 "logs": list(logs),
                 "pages": pages_snapshot,
             },
@@ -272,6 +407,9 @@ def create_studio_run(
 
     architect_output = run_manga_architect_agent(request_payload, story_concept, config)
     log_line(logs, started_at, "Manga architect agent returned structured page JSON.")
+    title = resolve_generated_title(request_payload, architect_output, title)
+    comic_summary = resolve_generated_summary(request_payload, architect_output, title)
+    suggested_hashtags = resolve_suggested_hashtags(request_payload, architect_output, title)
 
     series_name = sanitize_series_name(
         str(architect_output.get("series_name") or slugify(title).replace("-", "_"))
@@ -285,7 +423,14 @@ def create_studio_run(
         raise WorkflowExecutionError("The architect agent returned zero pages.")
     write_text_atomic(
         root / "storyboard.md",
-        build_storyboard_markdown(title=title, series_name=series_name, pages_payload=pages_payload),
+        build_storyboard_markdown(
+            title=title,
+            series_name=series_name,
+            pages_payload=pages_payload,
+            comic_summary=comic_summary,
+            suggested_hashtags=suggested_hashtags,
+            output_language=request_payload.output_language,
+        ),
     )
     publish(status="generating", progress=32, step=2)
 
@@ -299,6 +444,7 @@ def create_studio_run(
             config=config,
             started_at=started_at,
             logs=logs,
+            comic_title=title,
         )
         page_artifacts.append(artifact)
         publish(status="generating", progress=32, step=2)
@@ -334,6 +480,8 @@ def create_studio_run(
             bundle_size_bytes=directory_size_bytes(root),
             story_concept=story_concept,
             architect_output=architect_output,
+            comic_summary=comic_summary,
+            suggested_hashtags=suggested_hashtags,
             progress=52,
             step=2,
             logs=logs,
@@ -344,6 +492,8 @@ def create_studio_run(
             {
                 "story_concept": story_concept,
                 "architect_output": architect_output,
+                "comic_summary": comic_summary,
+                "suggested_hashtags": list(suggested_hashtags),
                 "pages": [page.to_dict() for page in page_artifacts],
             },
         )
@@ -371,6 +521,7 @@ def create_studio_run(
                 config=config,
                 started_at=started_at,
                 logs=logs,
+                session_log_path=session_log_path,
             ): artifact.id
             for artifact in page_artifacts
         }
@@ -423,6 +574,8 @@ def create_studio_run(
         bundle_size_bytes=0,
         story_concept=story_concept,
         architect_output=architect_output,
+        comic_summary=comic_summary,
+        suggested_hashtags=suggested_hashtags,
         progress=100 if status != "failed" else 42,
         step=4 if status != "failed" else 1,
         logs=logs,
@@ -434,6 +587,8 @@ def create_studio_run(
         {
             "story_concept": story_concept,
             "architect_output": architect_output,
+            "comic_summary": comic_summary,
+            "suggested_hashtags": list(suggested_hashtags),
             "pages": [page.to_dict() for page in page_artifacts],
         },
     )
@@ -478,10 +633,16 @@ def run_manga_architect_agent(
         "请基于以上故事概念，分析并告知这个漫画学习读本要划分为多少页比较合适，每页的内容是什么。"
         "每页内容必须用中文详细描述，包括对话内容。\n\n"
         f"优先控制在 {request_payload.sanitized_page_count()} 页左右，并确保内容适配 {request_payload.audience}。\n\n"
+        f"另外，请输出一个符合 {request_payload.output_language} 的漫画标题："
+        "如果是中文，限制在 20 个汉字以内；如果不是中文，限制在 20 个单词以内。"
+        "同时输出一段符合该语言的简短总结，以及 5 个建议 hashtags。\n\n"
         "同时，请为这个漫画系列生成一个简短的英文名称（用下划线连接单词，例如：learn_python_basics、understanding_gravity、math_adventures）。"
         "这个名称应该基于主题内容，简洁明了。\n\n"
         "请严格返回以下 JSON 格式：\n"
         "{\n"
+        ' "display_title": "localized title here",\n'
+        ' "comic_summary": "localized short paragraph summary here",\n'
+        ' "suggested_hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],\n'
         ' "series_name": "topic_name_here",\n'
         ' "total_pages": 5,\n'
         ' "pages_list": [\n'
@@ -492,6 +653,9 @@ def run_manga_architect_agent(
     )
     system_prompt = (
         "你是一位漫画主编，必须且仅能输出标准的 JSON 数据，严禁输出任何文字说明。"
+        "display_title 与 comic_summary 必须使用用户指定的输出语言。"
+        "如果输出语言是中文，display_title 必须不超过 20 个汉字；否则必须不超过 20 个单词。"
+        "suggested_hashtags 必须返回 5 个字符串组成的数组。"
         "series_name 必须是英文，用下划线连接，简洁明了。"
         "pages_list 中的 content 必须是详细的中文描述。"
     )
@@ -512,6 +676,7 @@ def prepare_page_artifact(
     config: WorkflowConfig,
     started_at: float,
     logs: list[list[str]],
+    comic_title: str = "",
 ) -> StudioPageArtifact:
     page_number = int(page_data.get("page_num") or 1)
     script = normalize_whitespace(str(page_data.get("content") or "")).strip()
@@ -522,7 +687,7 @@ def prepare_page_artifact(
         content=script,
         request_payload=request_payload,
         image_size=config.image_size,
-        comic_title=request_payload.resolved_title(),
+        comic_title=comic_title or request_payload.resolved_title(),
     )
     prompt_path = prompts_dir / f"{page_number:02d}-page-{series_name}.md"
     write_text_atomic(
@@ -563,22 +728,60 @@ def generate_prepared_page_artifact(
     config: WorkflowConfig,
     started_at: float,
     logs: list[list[str]],
+    session_log_path: Path | None = None,
+    session_elapsed_label: str | None = None,
 ) -> StudioPageArtifact:
     page_number = artifact.page_number
     max_attempts = 1 + config.image_retry_attempts
     last_error = ""
     text_response = ""
-    log_line(logs, started_at, f"Page {page_number:02d} image request started.")
+    active_prompt = artifact.prompt
+    emit_log(
+        logs,
+        started_at,
+        f"Page {page_number:02d} image request started.",
+        session_log_path=session_log_path,
+        session_elapsed_label=session_elapsed_label,
+    )
 
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
-            log_line(logs, started_at, f"Page {page_number:02d} retry {attempt - 1}/{config.image_retry_attempts} started.")
+            emit_log(
+                logs,
+                started_at,
+                f"Page {page_number:02d} retry {attempt - 1}/{config.image_retry_attempts} started.",
+                session_log_path=session_log_path,
+                session_elapsed_label=session_elapsed_label,
+            )
         try:
-            response_json = call_image_generation(prompt=artifact.prompt, config=config)
+            request_prompt = active_prompt
+            if attempt > 1 and should_compact_retry_prompt(last_error):
+                request_prompt = compact_image_retry_prompt(active_prompt)
+                if request_prompt != active_prompt:
+                    active_prompt = request_prompt
+                    emit_log(
+                        logs,
+                        started_at,
+                        f"Page {page_number:02d} retry prompt compacted to reduce upstream stream failures.",
+                        session_log_path=session_log_path,
+                        session_elapsed_label=session_elapsed_label,
+                    )
+            response_json = request_image_with_retry_strategy(
+                prompt=request_prompt,
+                config=config,
+                attempt=attempt,
+                previous_error=last_error,
+            )
             image_bytes, mime_type, text_response = extract_image_payload(response_json)
             if not image_bytes:
                 last_error = "No image generated from API"
-                log_line(logs, started_at, f"Page {page_number:02d} returned no image payload.")
+                emit_log(
+                    logs,
+                    started_at,
+                    f"Page {page_number:02d} returned no image payload.",
+                    session_log_path=session_log_path,
+                    session_elapsed_label=session_elapsed_label,
+                )
                 if attempt < max_attempts:
                     sleep_before_retry(attempt)
                     continue
@@ -588,7 +791,13 @@ def generate_prepared_page_artifact(
             image_path = pages_dir / file_name
             write_bytes_atomic(image_path, image_bytes)
             retry_note = f" after {attempt} attempts" if attempt > 1 else ""
-            log_line(logs, started_at, f"Page {page_number:02d} generated and saved locally{retry_note}.")
+            emit_log(
+                logs,
+                started_at,
+                f"Page {page_number:02d} generated and saved locally{retry_note}.",
+                session_log_path=session_log_path,
+                session_elapsed_label=session_elapsed_label,
+            )
             artifact = StudioPageArtifact(
                 id=f"page-{page_number:02d}",
                 page_number=page_number,
@@ -600,7 +809,7 @@ def generate_prepared_page_artifact(
                 image_path=str(image_path),
                 public_url=None,
                 status="success",
-                prompt=artifact.prompt,
+                prompt=active_prompt,
                 prompt_path=artifact.prompt_path,
                 mime_type=mime_type,
                 text_response=text_response,
@@ -609,7 +818,13 @@ def generate_prepared_page_artifact(
             return artifact
         except WorkflowExecutionError as exc:
             last_error = str(exc)
-            log_line(logs, started_at, f"Page {page_number:02d} failed attempt {attempt}/{max_attempts}: {exc}")
+            emit_log(
+                logs,
+                started_at,
+                f"Page {page_number:02d} failed attempt {attempt}/{max_attempts}: {exc}",
+                session_log_path=session_log_path,
+                session_elapsed_label=session_elapsed_label,
+            )
             if attempt >= max_attempts or not is_retriable_generation_error(last_error):
                 break
             sleep_before_retry(attempt)
@@ -660,8 +875,68 @@ def is_retriable_generation_error(message: str) -> bool:
     return any(marker in lowered for marker in retriable_markers)
 
 
+def should_compact_retry_prompt(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "http 502",
+            "http 503",
+            "http 504",
+            "stream disconnected",
+            "remote end closed",
+            "connection reset",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def should_serialize_retry_attempt(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "http 502",
+            "stream disconnected",
+            "remote end closed",
+            "connection reset",
+        )
+    )
+
+
+def request_image_with_retry_strategy(
+    prompt: str,
+    config: WorkflowConfig,
+    attempt: int,
+    previous_error: str,
+) -> dict[str, Any]:
+    if attempt <= 1 or not should_serialize_retry_attempt(previous_error):
+        return call_image_generation(prompt=prompt, config=config)
+    with _STREAM_RETRY_GATE:
+        return call_image_generation(prompt=prompt, config=config)
+
+
+def compact_image_retry_prompt(prompt: str, max_scene_chars: int = 900) -> str:
+    match = re.search(r"(本页情节：)(.*?)(\n\n要求：)", prompt, flags=re.S)
+    if match is None:
+        if len(prompt) <= max_scene_chars:
+            return prompt
+        return prompt[:max_scene_chars].rstrip() + "\n\n要求：保留核心场景、角色动作、中文对白，减少冗长背景说明。"
+
+    scene_text = normalize_whitespace(match.group(2))
+    if len(scene_text) <= max_scene_chars:
+        condensed_scene = scene_text
+    else:
+        condensed_scene = scene_text[:max_scene_chars].rstrip("，,。；;：: ")
+        condensed_scene += "。请保留核心场景、角色动作、关键道具与中文对白，不要扩写次要背景。"
+    return prompt[: match.start(2)] + condensed_scene + prompt[match.end(2) :]
+
+
 def sleep_before_retry(attempt: int) -> None:
-    time.sleep(min(20, 3 * attempt))
+    base_delay = min(45.0, 4.0 * (2 ** max(0, attempt - 1)))
+    jitter = random.uniform(0.0, min(3.0, attempt))
+    time.sleep(base_delay + jitter)
 
 
 def write_page_artifact(pages_dir: Path, artifact: StudioPageArtifact) -> None:
@@ -802,7 +1077,10 @@ def call_image_generation(prompt: str, config: WorkflowConfig) -> dict[str, Any]
     }
     return http_post_json(
         url=openai_compatible_url(config.image_base_url, "/images/generations"),
-        headers={"Authorization": f"Bearer {config.image_api_key}"},
+        headers={
+            "Authorization": f"Bearer {config.image_api_key}",
+            "Connection": "close",
+        },
         payload=payload,
         timeout_seconds=config.request_timeout_seconds,
         error_label="Image generation request failed",
@@ -939,15 +1217,47 @@ def build_storyboard_markdown(
     title: str,
     series_name: str,
     pages_payload: list[dict[str, Any]],
+    comic_summary: str = "",
+    suggested_hashtags: list[str] | None = None,
+    output_language: str = "",
 ) -> str:
     lines = [
         f"# {title}",
         "",
         f"Series slug: `{series_name}`",
         "",
-        "## Storyboard",
-        "",
     ]
+    if output_language:
+        lines.extend(
+            [
+                f"Output language: {output_language}",
+                "",
+            ]
+        )
+    if comic_summary:
+        lines.extend(
+            [
+                "## Summary",
+                "",
+                comic_summary,
+                "",
+            ]
+        )
+    if suggested_hashtags:
+        lines.extend(
+            [
+                "## Suggested Hashtags",
+                "",
+                " ".join(suggested_hashtags),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Storyboard",
+            "",
+        ]
+    )
     for page in pages_payload:
         page_num = int(page.get("page_num") or 1)
         content = str(page.get("content") or "").strip()
@@ -985,6 +1295,33 @@ def log_line(logs: list[list[str]], started_at: float, message: str) -> None:
     elapsed = max(0, int(time.monotonic() - started_at))
     minutes, seconds = divmod(elapsed, 60)
     logs.append([f"{minutes:02d}:{seconds:02d}", message])
+
+
+def emit_log(
+    logs: list[list[str]],
+    started_at: float,
+    message: str,
+    session_log_path: Path | None = None,
+    session_elapsed_label: str | None = None,
+) -> None:
+    log_line(logs, started_at, message)
+    if session_log_path is None:
+        return
+    persisted_logs: list[list[str]] = []
+    if session_log_path.exists():
+        try:
+            payload = json.loads(session_log_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("logs"), list):
+            persisted_logs = [
+                [str(entry[0]), str(entry[1])]
+                for entry in payload["logs"]
+                if isinstance(entry, list) and len(entry) == 2
+            ]
+    label = session_elapsed_label or logs[-1][0]
+    persisted_logs.append([label, message])
+    write_json_atomic(session_log_path, {"logs": persisted_logs})
 
 
 def directory_size_bytes(root: Path) -> int:
